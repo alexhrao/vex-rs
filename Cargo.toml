@@ -1,0 +1,10 @@
+[package]
+name = "vex-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5.13", features = ["derive", "unicode", "wrap_help"] }
+color-eyre = "0.6.3"
+regex = "1.10.6"
+thiserror = "1.0.63"
