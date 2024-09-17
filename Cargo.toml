@@ -5,6 +5,13 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "4.5.13", features = ["derive", "unicode", "wrap_help"] }
-color-eyre = "0.6.3"
+enum-map = "2.7.3"
+eyre = "0.6.12"
+miette = { version = "7.2.0", features = ["fancy"] }
 regex = "1.10.6"
+strum = { version = "0.26.3", features = ["derive"] }
 thiserror = "1.0.63"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
