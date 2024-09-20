@@ -13,5 +13,7 @@ strum = { version = "0.26.3", features = ["derive"] }
 thiserror = "1.0.63"
 
 [profile.release]
-lto = "fat"
+opt-level = 3
 codegen-units = 1
+strip = "symbols"
+panic = "abort"

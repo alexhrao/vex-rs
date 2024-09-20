@@ -1,5 +1,5 @@
 use clap::Parser;
-use miette::IntoDiagnostic;
+use miette::{Diagnostic, IntoDiagnostic, NamedSource, SourceSpan};
 use regex::Regex;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -8,8 +8,7 @@ use std::iter;
 use std::sync::LazyLock;
 use std::{fs, num::ParseIntError, str::FromStr};
 use strum::IntoEnumIterator;
-
-mod operation;
+use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumIter)]
 enum Resource {
@@ -500,75 +499,68 @@ impl<'a> Display for Issued<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ContentionType {
-    ReadWrite(Instruction),
-    WriteRead(Instruction),
-    WriteWrite(Instruction),
+    ReadWrite(Instruction, Instruction),
+    WriteRead(Instruction, Instruction),
+    WriteWrite(Instruction, Instruction),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl ContentionType {
+    fn get_insts(&self) -> (&Instruction, &Instruction) {
+        match self {
+            Self::ReadWrite(i1, i2) | Self::WriteRead(i1, i2) | Self::WriteWrite(i1, i2) => {
+                (i1, i2)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 enum Violation {
-    TooManyOperations(usize),
-    ResourceOverflow(Resource),
+    TooManyOperations(Instruction),
+    ResourceOverflow(Instruction, Resource),
     RegisterContention(usize, ContentionType),
     MemoryContention(ContentionType),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-struct ExecutionError {
-    inst: Instruction,
-    reason: Violation,
-}
-
-impl Display for ExecutionError {
+impl Display for Violation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let i2 = &self.inst;
-        f.write_str(&match &self.reason {
+        f.write_str(&match self {
             Violation::MemoryContention(t) => match t {
-                ContentionType::WriteWrite(i1) => format!(
+                ContentionType::WriteWrite(i1, i2) => format!(
                     "The {} writes to memory, but so does the {}",
                     i1.summary(),
                     i2.summary(),
                 ),
-                ContentionType::ReadWrite(i1) => {
+                ContentionType::ReadWrite(i1, i2) | ContentionType::WriteRead(i2, i1) => {
                     format!(
                         "The {} reads from memory, but the {} writes to memory",
                         i1.summary(),
                         i2.summary(),
                     )
                 }
-                ContentionType::WriteRead(i1) => {
-                    format!(
-                        "The {} writes to memory, but the {} reads from memory",
-                        i1.summary(),
-                        i2.summary(),
-                    )
-                }
             },
             Violation::RegisterContention(r, t) => match t {
-                ContentionType::WriteWrite(i1) => format!(
+                ContentionType::WriteWrite(i1, i2) => format!(
                     "The {} writes to register $r0.{r}, but so does the {}",
                     i1.summary(),
                     i2.summary()
                 ),
-                ContentionType::ReadWrite(i1) => {
+                ContentionType::ReadWrite(i1, i2) | ContentionType::WriteRead(i2, i1) => {
                     format!(
                         "The {} reads from register $r0.{r}, but the {} writes to it",
                         i1.summary(),
                         i2.summary()
                     )
                 }
-                ContentionType::WriteRead(i1) => {
-                    format!(
-                        "The {} writes to register $r0.{r}, but the {} reads from it",
-                        i1.summary(),
-                        i2.summary()
-                    )
-                }
             },
-            Violation::ResourceOverflow(r) => format!("Overflowed the {r} resource"),
-            Violation::TooManyOperations(u) => format!("Overflowed max number of slots ({u} used)"),
+            Violation::ResourceOverflow(i, r) => {
+                format!("The {} overflowed the {r} unit", i.summary())
+            }
+            Violation::TooManyOperations(i) => {
+                format!("The {} overflowed max number of slots", i.summary())
+            }
         })?;
-        f.write_str(". This has undefined behavior and thus is not allowed.")
+        f.write_str(". This has undefined behavior and is not allowed.")
     }
 }
 
@@ -621,32 +613,26 @@ impl<'a> Machine<'a> {
             Resource::Mul => &mut self.muls,
         }
     }
-    pub fn issue<I>(&mut self, insts: I, cycle: usize) -> Result<(), Box<ExecutionError>>
+    pub fn issue<I>(&mut self, insts: I, cycle: usize) -> Result<(), Box<Violation>>
     where
         I: IntoIterator<Item = &'a Instruction>,
     {
         for (count, i) in insts.into_iter().enumerate() {
             if count > self.num_slots {
-                return Err(Box::new(ExecutionError {
-                    inst: i.clone(),
-                    reason: Violation::TooManyOperations(count),
-                }));
+                return Err(Box::new(Violation::TooManyOperations(i.clone())));
             }
             // if any input is in our list of pending writes, bail
             for l in i.op.inputs() {
                 if let Some(prev) = self.pending_writes.get(&l) {
                     // So, someone is writing to this location. That's a problem
-                    return Err(Box::new(ExecutionError {
-                        inst: i.clone(),
-                        reason: match l {
-                            Location::Memory(_) => Violation::MemoryContention(
-                                ContentionType::WriteRead(prev.source.clone()),
-                            ),
-                            Location::Register(r) => Violation::RegisterContention(
-                                r,
-                                ContentionType::WriteRead(prev.source.clone()),
-                            ),
-                        },
+                    return Err(Box::new(match l {
+                        Location::Memory(_) => Violation::MemoryContention(
+                            ContentionType::WriteRead(prev.source.clone(), i.clone()),
+                        ),
+                        Location::Register(r) => Violation::RegisterContention(
+                            r,
+                            ContentionType::WriteRead(prev.source.clone(), i.clone()),
+                        ),
                     }));
                 }
             }
@@ -673,32 +659,26 @@ impl<'a> Machine<'a> {
             // Now, we are writing to something. We need to check BOTH pending reads and pending writes
             if let Some(outcome) = &c {
                 if let Some(prev) = self.pending_writes.get(&outcome.dst) {
-                    return Err(Box::new(ExecutionError {
-                        inst: i.clone(),
-                        reason: match outcome.dst {
-                            Location::Memory(_) => Violation::MemoryContention(
-                                ContentionType::WriteWrite(prev.source.clone()),
-                            ),
-                            Location::Register(r) => Violation::RegisterContention(
-                                r,
-                                ContentionType::WriteWrite(prev.source.clone()),
-                            ),
-                        },
+                    return Err(Box::new(match outcome.dst {
+                        Location::Memory(_) => Violation::MemoryContention(
+                            ContentionType::WriteWrite(prev.source.clone(), i.clone()),
+                        ),
+                        Location::Register(r) => Violation::RegisterContention(
+                            r,
+                            ContentionType::WriteWrite(prev.source.clone(), i.clone()),
+                        ),
                     }));
                 }
                 if let Some(issued) = self.pending_reads.get(&outcome.dst) {
                     if let Some(prev) = issued.iter().min_by_key(|i| i.start_cycle) {
-                        return Err(Box::new(ExecutionError {
-                            inst: i.clone(),
-                            reason: match outcome.dst {
-                                Location::Memory(_) => Violation::MemoryContention(
-                                    ContentionType::ReadWrite(prev.source.clone()),
-                                ),
-                                Location::Register(r) => Violation::RegisterContention(
-                                    r,
-                                    ContentionType::ReadWrite(prev.source.clone()),
-                                ),
-                            },
+                        return Err(Box::new(match outcome.dst {
+                            Location::Memory(_) => Violation::MemoryContention(
+                                ContentionType::ReadWrite(prev.source.clone(), i.clone()),
+                            ),
+                            Location::Register(r) => Violation::RegisterContention(
+                                r,
+                                ContentionType::ReadWrite(prev.source.clone(), i.clone()),
+                            ),
                         }));
                     }
                 }
@@ -709,10 +689,7 @@ impl<'a> Machine<'a> {
             let cap = self.capacity(r);
             let units = self.resource_mut(r);
             if units.len() == cap {
-                return Err(Box::new(ExecutionError {
-                    inst: i.clone(),
-                    reason: Violation::ResourceOverflow(r),
-                }));
+                return Err(Box::new(Violation::ResourceOverflow(i.clone(), r)));
             }
             let issued = Issued {
                 source: i,
@@ -740,7 +717,7 @@ impl<'a> Machine<'a> {
         }
         Ok(())
     }
-    pub fn commit(&mut self, cycle: usize) -> Result<Vec<Issued<'a>>, Box<ExecutionError>> {
+    pub fn commit(&mut self, cycle: usize) -> Vec<Issued<'a>> {
         let mut committed: Vec<Issued<'a>> = vec![];
         for r in Resource::iter() {
             let mut kept = vec![];
@@ -793,8 +770,7 @@ impl<'a> Machine<'a> {
         //  NOBODY can write to R1 in that 100 cycles, even if it finishes before/after?
         //  My opinion is yes; at decode time, the values are sent, and that the value
         //  is not written until exactly the last cycle
-
-        Ok(committed)
+        committed
     }
 }
 
@@ -825,13 +801,11 @@ impl<'a> Display for Machine<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
-struct Group {
-    insts: Vec<Instruction>,
-}
+struct Group(Vec<Instruction>);
 
 impl Display for Group {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for i in &self.insts {
+        for i in &self.0 {
             f.write_fmt(format_args!("{i}\n"))?;
         }
         f.write_str(";;")
@@ -839,6 +813,7 @@ impl Display for Group {
 }
 
 #[derive(clap::Parser, Debug)]
+#[command(version)]
 struct Args {
     /// Number of slots
     #[arg(long, short, default_value_t = 4)]
@@ -861,7 +836,7 @@ struct Args {
     /// Latency for LOAD operations
     #[arg(long, default_value_t = 3)]
     load_latency: usize,
-    /// Latency for LOAD operations
+    /// Latency for STORE operations
     #[arg(long, default_value_t = 3)]
     store_latency: usize,
     /// Assert to print debugging information; useful if your code is failing
@@ -896,6 +871,8 @@ enum ParameterError {
     ZeroLatency(Kind),
     #[error("Exactly 10 numbers must be provided; {0} given")]
     InvalidArguments(usize),
+    #[error("Input file `{0}` not found")]
+    FileNotFound(String),
 }
 
 impl<'a> Machine<'a> {
@@ -971,31 +948,49 @@ struct ParseError {
     source: InstructionParseError,
 }
 
+#[derive(Error, Debug, Diagnostic)]
+#[error("Execution Error")]
+#[diagnostic()]
+struct ExecutionDiagnostic {
+    #[help]
+    violation: Violation,
+    #[source_code]
+    src: NamedSource<String>,
+    #[label = "Offending Instruction"]
+    curr: SourceSpan,
+    #[label = "Previous Instruction"]
+    prev: Option<SourceSpan>,
+}
+
 fn main() -> miette::Result<()> {
     miette::set_hook(Box::new(|_| {
         Box::new(
             miette::MietteHandlerOpts::new()
                 .terminal_links(true)
-                .width(80)
+                .width(120)
                 .break_words(true)
                 .wrap_lines(true)
+                .context_lines(5)
                 .build(),
         )
     }))
     .into_diagnostic()?;
     let args = Args::parse();
-    let backing = fs::read_to_string(&args.file).into_diagnostic()?;
+    let backing = fs::read_to_string(&args.file)
+        .map_err(|_| ParameterError::FileNotFound(args.file.clone()))
+        .into_diagnostic()?;
     let lines = backing
         .lines()
         .enumerate()
         .skip_while(|&(_, l)| l != "#### BEGIN BASIC BLOCK ####")
         .skip(1)
         .take_while(|&(_, l)| l != "#### END BASIC BLOCK ####")
-        .map(|(i, l)| (i, l.trim()))
+        .map(|(i, l)| (i + 1, l.trim()))
         .filter(|&(_, l)| !l.starts_with('#'));
 
     let mut groups: Vec<Group> = vec![];
     let mut group = Group::default();
+    // let mut insts_by_line = HashMap::new();
     for (i, line) in lines {
         if line.starts_with(";;") {
             // eject
@@ -1010,17 +1005,22 @@ fn main() -> miette::Result<()> {
                     source,
                 })
                 .into_diagnostic()?;
-            group.insts.push(inst.with_line(i));
+            let inst = inst.with_line(i);
+            // insts_by_line.insert(i, inst.clone());
+            group.0.push(inst);
         }
     }
     // Push one more to ensure we have a cycle to clear the last of the pending
     groups.push(Group::default());
+    let groups = groups;
+
+    let lines: Vec<_> = backing.lines().collect();
 
     let mut machine = Machine::new(&args).into_diagnostic()?;
 
     for (cycle, g) in groups.iter().enumerate() {
         // Resolve anything that would finish this cycle
-        let resolved = machine.commit(cycle).into_diagnostic()?;
+        let resolved = machine.commit(cycle);
         if args.verbose {
             println!("{} resolved in cycle {cycle}:", resolved.len());
             for r in resolved {
@@ -1029,16 +1029,58 @@ fn main() -> miette::Result<()> {
         }
         // What is about to be issued?
         if args.verbose {
-            println!("{}/{} slots filled:", g.insts.len(), machine.num_slots);
-            for (s, inst) in g.insts.iter().enumerate() {
+            println!("{}/{} slots filled:", g.0.len(), machine.num_slots);
+            for (s, inst) in g.0.iter().enumerate() {
                 println!("\t{s}: {inst}");
             }
         }
         // Issue instructions to their respective resources
-        machine.issue(&g.insts, cycle).into_diagnostic()?;
-        // if let Err(e) = machine.issue(&g.insts, cycle) {
-        //     println!("{e}");
-        // }
+        if let Err(e) = machine.issue(&g.0, cycle) {
+            match &*e {
+                Violation::ResourceOverflow(i, _) | Violation::TooManyOperations(i) => {
+                    if let Some(line) = i.line {
+                        let before = lines[..line - 1].join("\n");
+                        let middle = lines[line - 1];
+                        let after = lines[line..].join("\n");
+                        let src_span = (before.len() + 1, middle.len());
+                        Err(ExecutionDiagnostic {
+                            src: NamedSource::new(
+                                &args.file,
+                                format!("{before}\n{middle}\n{after}"),
+                            ),
+                            curr: src_span.into(),
+                            prev: None,
+                            violation: *e,
+                        }).into_diagnostic()
+                    } else {
+                        Err(e).into_diagnostic()
+                    }
+                }
+                Violation::RegisterContention(_, c) | Violation::MemoryContention(c) => {
+                    let (i1, i2) = c.get_insts();
+                    if let (Some(l1), Some(l2)) = (i1.line, i2.line) {
+                        let first = lines[..l1.min(l2) - 1].join("\n");
+                        let i1_line = lines[l1.min(l2) - 1];
+                        let middle = lines[l1.min(l2)..l1.max(l2) - 1].join("\n");
+                        let i2_line = lines[l1.max(l2) - 1];
+                        let last = lines[l1.max(l2)..].join("\n");
+                        let prev_start = first.len() + 1;
+                        let curr_start = prev_start + i1_line.len() + 1 + middle.len() + 1;
+                        Err(ExecutionDiagnostic {
+                            src: NamedSource::new(
+                                &args.file,
+                                format!("{first}\n{i1_line}\n{middle}\n{i2_line}\n{last}"),
+                            ),
+                            prev: Some((prev_start, i1_line.len()).into()),
+                            curr: (curr_start, i2_line.len()).into(),
+                            violation: *e,
+                        }).into_diagnostic()
+                    } else {
+                        Err(e).into_diagnostic()
+                    }
+                }
+            }?;
+        }
         if args.verbose {
             println!("Machine state at the end of cycle {cycle}:\n{machine}");
         }
