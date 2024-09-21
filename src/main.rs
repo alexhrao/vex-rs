@@ -379,7 +379,7 @@ impl Display for Operation {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Instruction {
-    pub line: Option<usize>,
+    pub ctx: Option<(usize, SourceSpan)>,
     pub cluster: usize,
     pub op: Operation,
 }
@@ -387,7 +387,7 @@ struct Instruction {
 impl Instruction {
     pub fn summary(&self) -> String {
         let out = format!("{} instruction", self.op.cmd());
-        if let Some(line) = self.line {
+        if let Some((line, _)) = self.ctx {
             out + &format!(" on line {line}")
         } else {
             out
@@ -431,16 +431,15 @@ impl FromStr for Instruction {
         Ok(Instruction {
             cluster,
             op,
-            line: None,
+            ctx: None,
         })
     }
 }
 
 impl Instruction {
-    pub fn with_line(self, line: usize) -> Self {
+    pub fn with_context(self, ctx: (usize, SourceSpan)) -> Self {
         Instruction {
-            line: Some(line),
-            ..self
+            ctx: Some(ctx), ..self
         }
     }
 }
@@ -949,7 +948,7 @@ struct ParseError {
 }
 
 #[derive(Error, Debug, Diagnostic)]
-#[error("Execution Error")]
+#[error("Undefined Behavior")]
 #[diagnostic()]
 struct ExecutionDiagnostic {
     #[help]
@@ -957,7 +956,7 @@ struct ExecutionDiagnostic {
     #[source_code]
     src: NamedSource<String>,
     #[label = "Offending Instruction"]
-    curr: SourceSpan,
+    curr: Option<SourceSpan>,
     #[label = "Previous Instruction"]
     prev: Option<SourceSpan>,
 }
@@ -978,21 +977,33 @@ fn main() -> miette::Result<()> {
     let args = Args::parse();
     let backing = fs::read_to_string(&args.file)
         .map_err(|_| ParameterError::FileNotFound(args.file.clone()))
-        .into_diagnostic()?;
-    let lines = backing
+        .into_diagnostic()?
+        // Sanitize line endings
         .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let lines: Vec<(usize, SourceSpan, &str)> = backing.lines()
         .enumerate()
-        .skip_while(|&(_, l)| l != "#### BEGIN BASIC BLOCK ####")
-        .skip(1)
-        .take_while(|&(_, l)| l != "#### END BASIC BLOCK ####")
-        .map(|(i, l)| (i + 1, l.trim()))
-        .filter(|&(_, l)| !l.starts_with('#'));
+        .fold(vec![], |mut v, (i, line)| {
+            let start_idx = if let Some((_, span, _)) = v.last() {
+                span.offset() + span.len() + 1
+            } else {
+                0
+            };
+            v.push((i + 1, (start_idx, line.len()).into(), line));
+            v
+        });
 
     let mut groups: Vec<Group> = vec![];
     let mut group = Group::default();
-    // let mut insts_by_line = HashMap::new();
-    for (i, line) in lines {
-        if line.starts_with(";;") {
+    let inst_lines = lines.iter()
+        .skip_while(|&&(_, _, l)| l != "#### BEGIN BASIC BLOCK ####")
+        .skip(1)
+        .take_while(|&&(_, _, l)| l != "#### END BASIC BLOCK ####")
+        .filter(|&&(_, _, l)| !l.trim_start().starts_with('#'));
+    for &(i, span, line) in inst_lines {
+        if line.trim_start().starts_with(";;") {
             // eject
             groups.push(group);
             group = Group::default();
@@ -1005,16 +1016,12 @@ fn main() -> miette::Result<()> {
                     source,
                 })
                 .into_diagnostic()?;
-            let inst = inst.with_line(i);
-            // insts_by_line.insert(i, inst.clone());
-            group.0.push(inst);
+            group.0.push(inst.with_context((i, span)));
         }
     }
     // Push one more to ensure we have a cycle to clear the last of the pending
     groups.push(Group::default());
     let groups = groups;
-
-    let lines: Vec<_> = backing.lines().collect();
 
     let mut machine = Machine::new(&args).into_diagnostic()?;
 
@@ -1036,50 +1043,22 @@ fn main() -> miette::Result<()> {
         }
         // Issue instructions to their respective resources
         if let Err(e) = machine.issue(&g.0, cycle) {
-            match &*e {
+            let (prev, curr) = match &*e {
                 Violation::ResourceOverflow(i, _) | Violation::TooManyOperations(i) => {
-                    if let Some(line) = i.line {
-                        let before = lines[..line - 1].join("\n");
-                        let middle = lines[line - 1];
-                        let after = lines[line..].join("\n");
-                        let src_span = (before.len() + 1, middle.len());
-                        Err(ExecutionDiagnostic {
-                            src: NamedSource::new(
-                                &args.file,
-                                format!("{before}\n{middle}\n{after}"),
-                            ),
-                            curr: src_span.into(),
-                            prev: None,
-                            violation: *e,
-                        }).into_diagnostic()
-                    } else {
-                        Err(e).into_diagnostic()
-                    }
+                    (None, i.ctx.map(|(_, s)| s))
                 }
                 Violation::RegisterContention(_, c) | Violation::MemoryContention(c) => {
                     let (i1, i2) = c.get_insts();
-                    if let (Some(l1), Some(l2)) = (i1.line, i2.line) {
-                        let first = lines[..l1.min(l2) - 1].join("\n");
-                        let i1_line = lines[l1.min(l2) - 1];
-                        let middle = lines[l1.min(l2)..l1.max(l2) - 1].join("\n");
-                        let i2_line = lines[l1.max(l2) - 1];
-                        let last = lines[l1.max(l2)..].join("\n");
-                        let prev_start = first.len() + 1;
-                        let curr_start = prev_start + i1_line.len() + 1 + middle.len() + 1;
-                        Err(ExecutionDiagnostic {
-                            src: NamedSource::new(
-                                &args.file,
-                                format!("{first}\n{i1_line}\n{middle}\n{i2_line}\n{last}"),
-                            ),
-                            prev: Some((prev_start, i1_line.len()).into()),
-                            curr: (curr_start, i2_line.len()).into(),
-                            violation: *e,
-                        }).into_diagnostic()
-                    } else {
-                        Err(e).into_diagnostic()
-                    }
+                    (i1.ctx.map(|(_, s)| s), i2.ctx.map(|(_, s)| s))
                 }
-            }?;
+            };
+            Err(ExecutionDiagnostic {
+                src: NamedSource::new(
+                    &args.file,
+                    backing.clone(),
+                ),
+                prev, curr, violation: *e,
+            })?;
         }
         if args.verbose {
             println!("Machine state at the end of cycle {cycle}:\n{machine}");
