@@ -1,9 +1,10 @@
 use std::{fmt::Display, str::FromStr};
 
-use crate::{Location, Machine, Outcome};
+use crate::{operation::Alignment, Location, Machine, Outcome};
 
 use super::{
-    parse_num, trim_start, ParseError, Register, RegisterParseError, RegisterType, WithContext,
+    parse_num, trim_start, DecodeError, Info, ParseError, Register, RegisterParseError,
+    RegisterType, WithContext,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumIter)]
@@ -13,6 +14,16 @@ pub enum LoadOpcode {
     HalfWordUnsigned,
     ByteSigned,
     ByteUnsigned,
+}
+
+impl From<LoadOpcode> for Alignment {
+    fn from(value: LoadOpcode) -> Self {
+        match value {
+            LoadOpcode::ByteSigned | LoadOpcode::ByteUnsigned => Self::Byte,
+            LoadOpcode::HalfWordSigned | LoadOpcode::HalfWordUnsigned => Self::Half,
+            LoadOpcode::Word => Self::Word,
+        }
+    }
 }
 
 impl LoadOpcode {
@@ -49,9 +60,9 @@ impl Display for LoadOpcode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LoadArgs {
-    base: Register,
-    offset: u32,
-    dst: Register,
+    pub(crate) base: Register,
+    pub(crate) offset: u32,
+    pub(crate) dst: Register,
 }
 
 impl FromStr for LoadArgs {
@@ -63,14 +74,14 @@ impl FromStr for LoadArgs {
         if s.starts_with('=') {
             return Err(WithContext {
                 source: ParseError::NoRegister,
-                span: (idx, 0).into(),
+                ctx: (idx, 0).into(),
                 help: None,
             });
         }
         let Some((dst, s)) = s.split_once('=') else {
             return Err(WithContext {
                 source: ParseError::NoRegister,
-                span: (idx, 0).into(),
+                ctx: (idx, 0).into(),
                 help: None,
             });
         };
@@ -79,16 +90,16 @@ impl FromStr for LoadArgs {
             dst.parse()
                 .map_err(|r: WithContext<RegisterParseError>| WithContext {
                     source: r.source.into(),
-                    span: r.span_context(idx),
+                    ctx: r.span_context(idx),
                     help: None,
                 })?;
-        if dst.bank != RegisterType::General {
+        if dst.class != RegisterType::General {
             return Err(WithContext {
                 source: ParseError::WrongRegisterType {
                     wanted: RegisterType::General,
-                    got: dst.bank,
+                    got: dst.class,
                 },
-                span: (idx, 0).into(),
+                ctx: (idx, 0).into(),
                 help: None,
             });
         }
@@ -98,21 +109,21 @@ impl FromStr for LoadArgs {
         if s.starts_with('[') {
             return Err(WithContext {
                 source: ParseError::NoOffset,
-                span: (idx, 0).into(),
+                ctx: (idx, 0).into(),
                 help: None,
             });
         }
         let Some((offset, s)) = s.split_once('[') else {
             return Err(WithContext {
                 source: ParseError::NoOffset,
-                span: (idx, 0).into(),
+                ctx: (idx, 0).into(),
                 help: None,
             });
         };
         let val_len = offset.len();
         let offset = parse_num(offset).map_err(|e| WithContext {
             source: ParseError::BadOffset(e),
-            span: (idx, val_len).into(),
+            ctx: (idx, val_len).into(),
             help: None,
         })?;
         idx += val_len + 1;
@@ -121,31 +132,41 @@ impl FromStr for LoadArgs {
         if s.starts_with(']') {
             return Err(WithContext {
                 source: ParseError::NoRegister,
-                span: (idx, 0).into(),
+                ctx: (idx, 0).into(),
                 help: None,
             });
         }
         let Some((base, s)) = s.split_once(']') else {
             return Err(WithContext {
                 source: ParseError::NoRegister,
-                span: (idx, 0).into(),
+                ctx: (idx, 0).into(),
                 help: None,
             });
         };
         let val_len = base.len();
-        let base = base
-            .parse()
-            .map_err(|e: WithContext<RegisterParseError>| WithContext {
-                source: ParseError::BadRegister(e.source),
-                span: e.span_context(idx),
-                help: None,
-            })?;
+        let base: Register =
+            base.parse()
+                .map_err(|e: WithContext<RegisterParseError>| WithContext {
+                    source: ParseError::BadRegister(e.source),
+                    ctx: e.span_context(idx),
+                    help: None,
+                })?;
         idx += val_len + 1;
+        if base.class != RegisterType::General {
+            return Err(WithContext {
+                source: ParseError::WrongRegisterType {
+                    wanted: RegisterType::General,
+                    got: base.class,
+                },
+                ctx: (idx, 0).into(),
+                help: None,
+            });
+        }
         let s = trim_start(s, &mut idx);
         if !s.is_empty() {
             Err(WithContext {
                 source: ParseError::ExpectedEnd(s.to_owned()),
-                span: (idx, s.len()).into(),
+                ctx: (idx, s.len()).into(),
                 help: None,
             })
         } else {
@@ -154,29 +175,33 @@ impl FromStr for LoadArgs {
     }
 }
 
-impl LoadArgs {
-    pub fn inputs(&self) -> Vec<Location> {
-        vec![Location::Register(self.base), Location::Memory(0)]
+impl Info for LoadArgs {
+    type Opcode = LoadOpcode;
+    fn outputs(&self) -> Vec<Location> {
+        vec![Location::Register(self.dst)]
     }
-    pub fn decode(self, opcode: LoadOpcode, machine: &Machine) -> Outcome {
-        let addr = (machine[self.base] + self.offset) as usize;
-        let value = u32::from_ne_bytes(machine.mem[addr..addr + 4].try_into().unwrap());
-        let value = match opcode {
-            LoadOpcode::Word => value,
-            LoadOpcode::HalfWordSigned | LoadOpcode::HalfWordUnsigned => value & 0xffff,
-            LoadOpcode::ByteSigned | LoadOpcode::ByteUnsigned => value & 0xff,
-        };
-        Outcome {
+    fn inputs(&self) -> Vec<Location> {
+        vec![
+            Location::Register(self.base),
+            Location::Memory(0, Alignment::default()),
+        ]
+    }
+    fn decode(&self, opcode: LoadOpcode, machine: &Machine) -> Result<Vec<Outcome>, DecodeError> {
+        let addr = (machine.get_reg(self.base)? + self.offset) as usize;
+        let value = machine.read_memory(addr, opcode.into())?.as_u32();
+        // Make sure destination register works
+        machine.get_reg(self.dst)?;
+        Ok(vec![Outcome {
             dst: Location::Register(self.dst),
             value,
-        }
+        }])
     }
 }
 
 impl Display for LoadArgs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!(
-            "$r0.{} = 0x{:x}[$r0.{}]",
+            "{} = 0x{:02x}[{}]",
             self.dst, self.offset, self.base
         ))
     }
@@ -195,6 +220,13 @@ impl StoreOpcode {
             Self::Word => "stw",
             Self::HalfWord => "sth",
             Self::Byte => "stb",
+        }
+    }
+    pub const fn alignment(self) -> Alignment {
+        match self {
+            Self::Word => Alignment::Word,
+            Self::HalfWord => Alignment::Half,
+            Self::Byte => Alignment::Byte,
         }
     }
 }
@@ -219,9 +251,9 @@ impl Display for StoreOpcode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StoreArgs {
-    base: Register,
-    offset: u32,
-    src: Register,
+    pub(crate) base: Register,
+    pub(crate) offset: u32,
+    pub(crate) src: Register,
 }
 
 impl FromStr for StoreArgs {
@@ -233,21 +265,21 @@ impl FromStr for StoreArgs {
         if s.starts_with('[') {
             return Err(WithContext {
                 source: ParseError::NoOffset,
-                span: (idx, 0).into(),
+                ctx: (idx, 0).into(),
                 help: None,
             });
         }
         let Some((offset, s)) = s.split_once('[') else {
             return Err(WithContext {
                 source: ParseError::NoOffset,
-                span: (idx, 0).into(),
+                ctx: (idx, 0).into(),
                 help: None,
             });
         };
         let val_len = offset.len();
         let offset = parse_num(offset).map_err(|e| WithContext {
             source: ParseError::BadOffset(e),
-            span: (idx, val_len).into(),
+            ctx: (idx, val_len).into(),
             help: None,
         })?;
         idx += val_len + 1;
@@ -256,25 +288,35 @@ impl FromStr for StoreArgs {
         if s.starts_with(']') {
             return Err(WithContext {
                 source: ParseError::NoRegister,
-                span: (idx, 0).into(),
+                ctx: (idx, 0).into(),
                 help: None,
             });
         }
-        let Some((base, _)) = s.split_once(']') else {
+        let Some((base, s)) = s.split_once(']') else {
             return Err(WithContext {
                 source: ParseError::NoRegister,
-                span: (idx, 0).into(),
+                ctx: (idx, 0).into(),
                 help: None,
             });
         };
         let val_len = base.len();
-        let base = base
-            .parse()
-            .map_err(|e: WithContext<RegisterParseError>| WithContext {
-                source: ParseError::BadRegister(e.source),
-                span: e.span_context(idx),
+        let base: Register =
+            base.parse()
+                .map_err(|e: WithContext<RegisterParseError>| WithContext {
+                    source: ParseError::BadRegister(e.source),
+                    ctx: e.span_context(idx),
+                    help: None,
+                })?;
+        if base.class != RegisterType::General {
+            return Err(WithContext {
+                source: ParseError::WrongRegisterType {
+                    wanted: RegisterType::General,
+                    got: base.class,
+                },
+                ctx: (idx, 0).into(),
                 help: None,
-            })?;
+            });
+        }
         idx += val_len + 1;
         // Chomp the source register
         let s = trim_start(s, &mut idx);
@@ -284,17 +326,18 @@ impl FromStr for StoreArgs {
                     wanted: '=',
                     got: super::UnexpectedValue(s.chars().next()),
                 },
-                span: (idx, 0).into(),
+                ctx: (idx, 0).into(),
                 help: None,
             });
         }
         let s = &s[1..];
         idx += 1;
         let s = trim_start(s, &mut idx);
-        let Some(src) = s.split_whitespace().next() else {
+        let mut splitter = s.split_whitespace();
+        let Some(src) = splitter.next() else {
             return Err(WithContext {
                 source: ParseError::NoRegister,
-                span: (idx, 0).into(),
+                ctx: (idx, 0).into(),
                 help: None,
             });
         };
@@ -304,25 +347,25 @@ impl FromStr for StoreArgs {
             src.parse()
                 .map_err(|r: WithContext<RegisterParseError>| WithContext {
                     source: r.source.into(),
-                    span: r.span_context(idx),
+                    ctx: r.span_context(idx),
                     help: None,
                 })?;
-        if src.bank != RegisterType::General {
+        if src.class != RegisterType::General {
             return Err(WithContext {
                 source: ParseError::WrongRegisterType {
                     wanted: RegisterType::General,
-                    got: src.bank,
+                    got: src.class,
                 },
-                span: (idx, 0).into(),
+                ctx: (idx, 0).into(),
                 help: None,
             });
         }
         idx += val_len + 1;
-        let s = trim_start(s, &mut idx);
+        let s = trim_start(splitter.next().unwrap_or_default(), &mut idx);
         if !s.is_empty() {
             Err(WithContext {
                 source: ParseError::ExpectedEnd(s.to_owned()),
-                span: (idx, s.len()).into(),
+                ctx: (idx, s.len()).into(),
                 help: None,
             })
         } else {
@@ -331,42 +374,210 @@ impl FromStr for StoreArgs {
     }
 }
 
-impl StoreArgs {
-    pub fn inputs(&self) -> Vec<Location> {
+impl Info for StoreArgs {
+    type Opcode = StoreOpcode;
+    fn inputs(&self) -> Vec<Location> {
         vec![Location::Register(self.base), Location::Register(self.src)]
     }
-    pub fn decode(&self, _opcode: StoreOpcode, machine: &Machine) -> Outcome {
-        let addr = (machine[self.base] + self.offset) as usize;
-        Outcome {
-            dst: Location::Memory(addr),
-            value: machine[self.src],
-        }
+    fn outputs(&self) -> Vec<Location> {
+        vec![Location::Memory(0, Alignment::default())]
+    }
+    fn decode(&self, opcode: StoreOpcode, machine: &Machine) -> Result<Vec<Outcome>, DecodeError> {
+        let addr = (machine.get_reg(self.base)? + self.offset) as usize;
+        let value = machine.get_reg(self.src)?;
+        // Make sure the destination address works
+        machine.read_memory(addr, opcode.alignment())?;
+        Ok(vec![Outcome {
+            value,
+            dst: Location::Memory(addr, opcode.alignment()),
+        }])
     }
 }
 
 impl Display for StoreArgs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!(
-            "0x{:x}[$r0.{}] = $r0.{}",
-            self.offset, self.base, self.src
-        ))
+        let Self { offset, base, src } = self;
+        f.write_fmt(format_args!("0x{offset:02x}[{base}] = {src}"))
     }
 }
 
 #[cfg(test)]
 mod test {
 
-    use super::super::{ParseError, RegisterParseError};
-    use super::LoadArgs;
+    use crate::operation::{Register, RegisterType};
+
+    use super::{LoadArgs, StoreArgs};
+
+    use super::super::test::{display, negative, positive};
 
     #[test]
-    fn load_parse_errors() {
-        let inst = " $r1.2 = 0x24[$r0.1] ## restore ## t16";
-        let e = inst.parse::<LoadArgs>().unwrap_err();
-        assert_eq!(3, e.span.offset());
-        assert!(matches!(
-            e.source,
-            ParseError::BadRegister(RegisterParseError::Cluster)
-        ));
+    fn load_parser() {
+        positive(&[
+            (
+                " $r0.4 = 0x20 [ $r0.1]",
+                LoadArgs {
+                    base: Register {
+                        num: 1,
+                        class: RegisterType::General,
+                    },
+                    offset: 0x20,
+                    dst: Register {
+                        num: 4,
+                        class: RegisterType::General,
+                    },
+                },
+            ),
+            (
+                "$r0.4=5[$r0.1]",
+                LoadArgs {
+                    base: Register {
+                        num: 1,
+                        class: RegisterType::General,
+                    },
+                    offset: 5,
+                    dst: Register {
+                        num: 4,
+                        class: RegisterType::General,
+                    },
+                },
+            ),
+            (
+                "        $r0.4       = 5     [$r0.1]    ",
+                LoadArgs {
+                    base: Register {
+                        num: 1,
+                        class: RegisterType::General,
+                    },
+                    offset: 5,
+                    dst: Register {
+                        num: 4,
+                        class: RegisterType::General,
+                    },
+                },
+            ),
+        ]);
+
+        negative::<LoadArgs, _>(&[
+            "$r0.2 = 0x24[$r0.1]  f",
+            "$r0.-1 =' 0x24[$r0.1]",
+            "$r0.2 = 0xg24[$r0.1]",
+            "$r0.2 = 0x24[r0.1]",
+            "$r0.2 = 0x24[$b0.1]",
+            "$r0.2 = [$r0.1]",
+            "$r0.2 = 0x24[]",
+            "= 0x24[$r0.1]",
+        ]);
+    }
+
+    #[test]
+    fn load_display() {
+        display(&[
+            (
+                "$r0.2 = 0x24[$r0.1]",
+                LoadArgs {
+                    base: Register {
+                        class: RegisterType::General,
+                        num: 1,
+                    },
+                    dst: Register {
+                        class: RegisterType::General,
+                        num: 2,
+                    },
+                    offset: 0x24,
+                },
+            ),
+            (
+                "$r0.2 = 0x01[$r0.1]",
+                LoadArgs {
+                    base: Register {
+                        class: RegisterType::General,
+                        num: 1,
+                    },
+                    dst: Register {
+                        class: RegisterType::General,
+                        num: 2,
+                    },
+                    offset: 0x1,
+                },
+            ),
+        ])
+    }
+
+    #[test]
+    fn store_parser() {
+        positive(&[
+            (
+                "0x20[$r0.1]=$r0.4",
+                StoreArgs {
+                    base: Register {
+                        num: 1,
+                        class: RegisterType::General,
+                    },
+                    offset: 0x20,
+                    src: Register {
+                        num: 4,
+                        class: RegisterType::General,
+                    },
+                },
+            ),
+            (
+                "   5      [ $r0.1      ]    =        $r0.4   ",
+                StoreArgs {
+                    base: Register {
+                        num: 1,
+                        class: RegisterType::General,
+                    },
+                    offset: 5,
+                    src: Register {
+                        num: 4,
+                        class: RegisterType::General,
+                    },
+                },
+            ),
+        ]);
+
+        negative::<StoreArgs, _>(&[
+            "0x24[$r0.1] = $r0.2  f",
+            "0xg24[$r0.1] = $r0.2",
+            "0x24[r0.1] =' $r0.2",
+            "0x24[$b0.1] = $r0.2",
+            "[$r0.1] = $r0.2",
+            "0x24[] = $r0.2",
+            "0x24[$r0.1] =",
+        ]);
+    }
+
+    #[test]
+    fn store_display() {
+        display(&[
+            (
+                "0x01[$r0.1] = $r0.2",
+                StoreArgs {
+                    base: Register {
+                        class: RegisterType::General,
+                        num: 1,
+                    },
+                    src: Register {
+                        class: RegisterType::General,
+                        num: 2,
+                    },
+                    offset: 1,
+                },
+            ),
+            (
+                "0x24[$r0.1] = $r0.2",
+                StoreArgs {
+                    base: Register {
+                        class: RegisterType::General,
+                        num: 1,
+                    },
+                    src: Register {
+                        class: RegisterType::General,
+                        num: 2,
+                    },
+                    offset: 0x24,
+                },
+            ),
+        ])
     }
 }
