@@ -189,8 +189,8 @@ impl From<&[u8]> for MemoryValue {
     fn from(value: &[u8]) -> Self {
         match value.len() {
             1 => Self::Byte(value[0]),
-            2 => Self::Half(u16::from_ne_bytes(value.try_into().unwrap())),
-            4 => Self::Word(u32::from_ne_bytes(value.try_into().unwrap())),
+            2 => Self::Half(u16::from_be_bytes(value.try_into().unwrap())),
+            4 => Self::Word(u32::from_be_bytes(value.try_into().unwrap())),
             _ => unreachable!(),
         }
     }
@@ -319,8 +319,8 @@ impl<'a> Machine<'a> {
                 .ok_or(DecodeError::AddressOutOfBounds(addr, align))?;
             match value {
                 MemoryValue::Byte(b) => bytes[0] = b,
-                MemoryValue::Half(h) => bytes.copy_from_slice(&h.to_ne_bytes()),
-                MemoryValue::Word(w) => bytes.copy_from_slice(&w.to_ne_bytes()),
+                MemoryValue::Half(h) => bytes.copy_from_slice(&h.to_be_bytes()),
+                MemoryValue::Word(w) => bytes.copy_from_slice(&w.to_be_bytes()),
             };
             Ok(())
         }
@@ -594,9 +594,9 @@ impl<'a> TryFrom<&Args> for Machine<'a> {
         let mut mem = vec![0u8; args.mem_size];
         let mut regs = vec![0u32; args.num_regs + 1];
         for (m, n) in (0x18..=0x2c).step_by(4).zip(args.nums.iter().skip(1)) {
-            mem[m..m + 4].copy_from_slice(&n.to_ne_bytes());
+            mem[m..m + 4].copy_from_slice(&n.to_be_bytes());
         }
-        mem[0x30..0x34].copy_from_slice(&args.nums[8].to_ne_bytes());
+        mem[0x30..0x34].copy_from_slice(&args.nums[8].to_be_bytes());
         regs[3] = args.nums[9];
         Ok(Machine {
             mem,

@@ -3,7 +3,7 @@ use std::{fmt::Display, str::FromStr};
 use crate::{operation::Alignment, Location, Machine, Outcome};
 
 use super::{
-    parse_num, trim_start, DecodeError, Info, ParseError, Register, RegisterParseError,
+    parse_num, reg_err, trim_start, DecodeError, Info, ParseError, Register, RegisterParseError,
     RegisterType, WithContext,
 };
 
@@ -71,13 +71,6 @@ impl FromStr for LoadArgs {
         let mut idx = 0;
         let s = trim_start(s, &mut idx);
         // Chomp the destination register
-        if s.starts_with('=') {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        }
         let Some((dst, s)) = s.split_once('=') else {
             return Err(WithContext {
                 source: ParseError::NoRegister,
@@ -86,13 +79,7 @@ impl FromStr for LoadArgs {
             });
         };
         let val_len = dst.len();
-        let dst: Register =
-            dst.parse()
-                .map_err(|r: WithContext<RegisterParseError>| WithContext {
-                    source: r.source.into(),
-                    ctx: r.span_context(idx),
-                    help: None,
-                })?;
+        let dst: Register = dst.parse().map_err(|r| reg_err(r, idx))?;
         if dst.class != RegisterType::General {
             return Err(WithContext {
                 source: ParseError::WrongRegisterType {
@@ -106,13 +93,6 @@ impl FromStr for LoadArgs {
         // We're past the =, trim and get the offset
         idx += val_len + 1;
         let s = trim_start(s, &mut idx);
-        if s.starts_with('[') {
-            return Err(WithContext {
-                source: ParseError::NoOffset,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        }
         let Some((offset, s)) = s.split_once('[') else {
             return Err(WithContext {
                 source: ParseError::NoOffset,
@@ -129,13 +109,6 @@ impl FromStr for LoadArgs {
         idx += val_len + 1;
         let s = trim_start(s, &mut idx);
         // We're now at the [reg]. get to the next ]
-        if s.starts_with(']') {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        }
         let Some((base, s)) = s.split_once(']') else {
             return Err(WithContext {
                 source: ParseError::NoRegister,
@@ -262,13 +235,6 @@ impl FromStr for StoreArgs {
         let mut idx = 0;
         let s = trim_start(s, &mut idx);
         // Chomp the offset
-        if s.starts_with('[') {
-            return Err(WithContext {
-                source: ParseError::NoOffset,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        }
         let Some((offset, s)) = s.split_once('[') else {
             return Err(WithContext {
                 source: ParseError::NoOffset,
@@ -285,13 +251,6 @@ impl FromStr for StoreArgs {
         idx += val_len + 1;
         // Chomp the base register
         let s = trim_start(s, &mut idx);
-        if s.starts_with(']') {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        }
         let Some((base, s)) = s.split_once(']') else {
             return Err(WithContext {
                 source: ParseError::NoRegister,
@@ -343,13 +302,7 @@ impl FromStr for StoreArgs {
         };
 
         let val_len = src.len();
-        let src: Register =
-            src.parse()
-                .map_err(|r: WithContext<RegisterParseError>| WithContext {
-                    source: r.source.into(),
-                    ctx: r.span_context(idx),
-                    help: None,
-                })?;
+        let src: Register = src.parse().map_err(|r| reg_err(r, idx))?;
         if src.class != RegisterType::General {
             return Err(WithContext {
                 source: ParseError::WrongRegisterType {

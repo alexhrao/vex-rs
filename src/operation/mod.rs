@@ -10,7 +10,9 @@ use thiserror::Error;
 use crate::{Machine, Outcome, Resource};
 
 mod arithmetic;
+mod help;
 mod intercluster;
+mod logical;
 mod memory;
 
 const COMMENT_START: char = '#';
@@ -77,7 +79,7 @@ pub enum DecodeError {
 pub struct WithContext<S> {
     pub source: S,
     pub ctx: SourceSpan,
-    pub help: Option<String>,
+    pub help: Option<Cow<'static, str>>,
 }
 
 impl<S> WithContext<S> {
@@ -310,11 +312,6 @@ pub fn parse_num(num: &str) -> Result<u32, ParseIntError> {
     }
 }
 
-fn remove_comment(s: &str) -> &str {
-    // Remove comment
-    s.find(COMMENT_START).map_or(s, |com| &s[..com])
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Action {
     BasicArithmetic(arithmetic::BasicOpcode, arithmetic::BasicArgs),
@@ -324,6 +321,11 @@ pub enum Action {
     Store(memory::StoreOpcode, memory::StoreArgs),
     Extend(arithmetic::ExtendOpcode, arithmetic::ExtendArgs),
     Move(intercluster::MoveArgs),
+    Send(intercluster::SendArgs),
+    Recv(intercluster::RecvArgs),
+    Compare(logical::CompareOpcode, logical::CompareArgs),
+    Logical(logical::LogicalOpcode, logical::LogicalArgs),
+    Select(logical::SelectOpcode, logical::SelectArgs),
 }
 
 /// Trim the start, and update the idx to point at the new start
@@ -334,6 +336,14 @@ fn trim_start<'a>(s: &'a str, idx: &mut usize) -> &'a str {
     s
 }
 
+/// Map a register error with context
+fn reg_err(r: WithContext<RegisterParseError>, idx: usize) -> WithContext<ParseError> {
+    WithContext {
+        source: r.source.into(),
+        ctx: r.span_context(idx),
+        help: None,
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct UnexpectedValue(Option<char>);
 
@@ -368,6 +378,8 @@ pub enum ParseError {
     NoOffset,
     #[error("Failed to parse offset: {0}")]
     BadOffset(ParseIntError),
+    #[error("Failed to parse immediate: {0}")]
+    BadImmediate(ParseIntError),
     #[error("Expected a value, but got none")]
     NoValue,
     #[error("Failed to parse operand `{0}`")]
@@ -387,7 +399,9 @@ impl ParseError {
             | Self::BadRegister(_)
             | Self::WrongRegisterType { got: _, wanted: _ } => Cow::Borrowed("register"),
             Self::NoOffset | Self::BadOffset(_) => Cow::Borrowed("offset"),
-            Self::NoValue | Self::BadOperand(_, _) => Cow::Borrowed("value"),
+            Self::NoValue | Self::BadOperand(_, _) | Self::BadImmediate(_) => {
+                Cow::Borrowed("value")
+            }
             Self::ExpectedEnd(_) => Cow::Borrowed("problem"),
             Self::UnexpectedCharacter { wanted, got: _ } => {
                 Cow::Owned(format!("Expected '{wanted}'"))
@@ -405,7 +419,7 @@ impl From<RegisterParseError> for ParseError {
 impl FromStr for Action {
     type Err = WithContext<ParseError>;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let s = remove_comment(s);
+        let s = s.find(COMMENT_START).map_or(s, |com| &s[..com]);
         let mut idx = 0;
         let s = trim_start(s, &mut idx);
         static OPCODE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\w+").unwrap());
@@ -414,7 +428,7 @@ impl FromStr for Action {
             return Err(WithContext {
                 source: ParseError::NoOpcode,
                 ctx: (idx, 0).into(),
-                help: Some(String::from("All instructions must begin with a cluster, and then an opcode (e.g., `add`, `ldw`, ...)")),
+                help: Some(help::NO_OPCODE.into()),
             });
         };
         let opcode = cap.as_str();
@@ -437,10 +451,20 @@ impl FromStr for Action {
             Ok(Self::Store(st_opcode, rest.parse().map_err(err)?))
         } else if let Ok(ex_opcode) = opcode.parse::<arithmetic::ExtendOpcode>() {
             Ok(Self::Extend(ex_opcode, rest.parse().map_err(err)?))
+        } else if let Ok(cmp_opcode) = opcode.parse::<logical::CompareOpcode>() {
+            Ok(Self::Compare(cmp_opcode, rest.parse().map_err(err)?))
+        } else if let Ok(lg_opcode) = opcode.parse::<logical::LogicalOpcode>() {
+            Ok(Self::Logical(lg_opcode, rest.parse().map_err(err)?))
+        } else if let Ok(slct_opcode) = opcode.parse::<logical::SelectOpcode>() {
+            Ok(Self::Select(slct_opcode, rest.parse().map_err(err)?))
         } else if opcode == "sub" {
             Ok(Self::Sub(rest.parse().map_err(err)?))
         } else if opcode == "mov" {
             Ok(Self::Move(rest.parse().map_err(err)?))
+        } else if opcode == "send" {
+            Ok(Self::Send(rest.parse().map_err(err)?))
+        } else if opcode == "recv" {
+            Ok(Self::Recv(rest.parse().map_err(err)?))
         } else {
             // No matched op code
             let help = arithmetic::BasicOpcode::iter()
@@ -448,7 +472,7 @@ impl FromStr for Action {
                 .chain(memory::LoadOpcode::iter().map(LoadOpcode::code))
                 .filter_map(|op| fuzzy_match(opcode, op).map(|s| (op, s)))
                 .max_by_key(|&(_, s)| s)
-                .map(|(op, _)| format!("Perhaps you meant {op} instead?"));
+                .map(|(op, _)| format!("Perhaps you meant {op} instead?").into());
 
             Err(WithContext {
                 source: ParseError::UnknownOpcode(cap.as_str().to_owned()),
@@ -469,6 +493,11 @@ impl Action {
             Self::Load(_, load) => load.inputs(),
             Self::Store(_, store) => store.inputs(),
             Self::Move(args) => args.inputs(),
+            Self::Send(args) => args.inputs(),
+            Self::Recv(args) => args.inputs(),
+            Self::Compare(_, args) => args.inputs(),
+            Self::Logical(_, args) => args.inputs(),
+            Self::Select(_, args) => args.inputs(),
         }
     }
     pub fn outputs(&self) -> Vec<Location> {
@@ -480,6 +509,11 @@ impl Action {
             Self::Load(_, load) => load.outputs(),
             Self::Store(_, store) => store.outputs(),
             Self::Move(args) => args.outputs(),
+            Self::Send(args) => args.outputs(),
+            Self::Recv(args) => args.outputs(),
+            Self::Compare(_, args) => args.outputs(),
+            Self::Logical(_, args) => args.outputs(),
+            Self::Select(_, args) => args.outputs(),
         }
     }
     pub fn decode(&self, machine: &Machine) -> Result<Vec<Outcome>, DecodeError> {
@@ -491,6 +525,11 @@ impl Action {
             Self::Load(op, args) => args.decode(*op, machine),
             Self::Store(op, args) => args.decode(*op, machine),
             Self::Move(args) => args.decode((), machine),
+            Self::Send(args) => args.decode((), machine),
+            Self::Recv(args) => args.decode((), machine),
+            Self::Compare(op, args) => args.decode(*op, machine),
+            Self::Logical(op, args) => args.decode(*op, machine),
+            Self::Select(op, args) => args.decode(*op, machine),
         }
     }
     pub const fn code(&self) -> &'static str {
@@ -501,14 +540,21 @@ impl Action {
             Self::CarryArithmetic(op, _) => op.code(),
             Self::Load(op, _) => op.code(),
             Self::Store(op, _) => op.code(),
+            Self::Compare(op, _) => op.code(),
+            Self::Logical(op, _) => op.code(),
+            Self::Select(op, _) => op.code(),
             Self::Move(_) => "mov",
+            Self::Send(_) => "send",
+            Self::Recv(_) => "recv",
         }
     }
     pub const fn kind(&self) -> Kind {
         match self {
             Self::BasicArithmetic(op, _) => op.kind(),
             Self::CarryArithmetic(op, _) => op.kind(),
-            Self::Sub(_) | Self::Extend(_, _) | Self::Move(_) => Kind::Arithmetic,
+            Self::Sub(_) | Self::Extend(_, _) => Kind::Arithmetic,
+            Self::Move(_) | Self::Send(_) | Self::Recv(_) => Kind::Arithmetic,
+            Self::Compare(_, _) | Self::Logical(_, _) | Self::Select(_, _) => Kind::Arithmetic,
             Self::Load(_, _) => Kind::Load,
             Self::Store(_, _) => Kind::Store,
         }
@@ -521,10 +567,15 @@ impl Display for Action {
             Self::BasicArithmetic(op, args) => f.write_fmt(format_args!("{op} {args}")),
             Self::CarryArithmetic(op, args) => f.write_fmt(format_args!("{op} {args}")),
             Self::Sub(args) => f.write_fmt(format_args!("sub {args}")),
-            Self::Move(args) => f.write_fmt(format_args!("mov {args}")),
             Self::Extend(op, args) => f.write_fmt(format_args!("{op} {args}")),
             Self::Load(op, args) => f.write_fmt(format_args!("{op} {args}")),
             Self::Store(op, args) => f.write_fmt(format_args!("{op} {args}")),
+            Self::Move(args) => f.write_fmt(format_args!("mov {args}")),
+            Self::Send(args) => f.write_fmt(format_args!("send {args}")),
+            Self::Recv(args) => f.write_fmt(format_args!("recv {args}")),
+            Self::Compare(op, args) => f.write_fmt(format_args!("{op} {args}")),
+            Self::Logical(op, args) => f.write_fmt(format_args!("{op} {args}")),
+            Self::Select(op, args) => f.write_fmt(format_args!("{op} {args}")),
         }
     }
 }
@@ -573,7 +624,7 @@ impl FromStr for Operation {
                     got: UnexpectedValue(s.chars().next()),
                 },
                 ctx: (idx, 0).into(),
-                help: Some(String::from("Clusters must begin with the letter `c`")),
+                help: Some(help::BAD_CLUSTER.into()),
             });
         }
         let s = &s[1..];
@@ -584,12 +635,12 @@ impl FromStr for Operation {
             return Err(WithContext {
                 source: ParseError::NoCluster,
                 ctx: (idx, 0).into(),
-                help: Some(String::from("All instructions must have a cluster")),
+                help: Some(help::NO_CLUSTER.into()),
             });
         };
         let cluster = c.as_str().parse().map_err(|_e| WithContext {
             source: ParseError::NoOffset,
-            ctx: (idx, c.len()).into(),
+            ctx: (idx, c.len() - 1).into(),
             help: None,
         })?;
         idx += c.len();

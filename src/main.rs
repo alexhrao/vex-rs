@@ -180,7 +180,7 @@ struct ParseDiagnostic {
     #[source_code]
     src: NamedSource<String>,
     #[help]
-    help: Option<String>,
+    help: Option<Cow<'static, str>>,
 }
 
 fn main() -> miette::Result<()> {

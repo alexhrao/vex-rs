@@ -3,51 +3,100 @@ use std::{fmt::Display, str::FromStr};
 use crate::{Location, Machine, Outcome};
 
 use super::{
-    trim_start, DecodeError, Info, Kind, Operand, OperandParseError, ParseError, Register,
-    RegisterParseError, RegisterType, WithContext,
+    reg_err, trim_start, DecodeError, Info, Kind, Operand, OperandParseError, ParseError, Register,
+    RegisterType, WithContext,
 };
 
+/// Basic Opcodes for Arithmetic
+///
+/// "Basic" here means that is follows the [`BasicArgs`] convention;
+/// in other words, an instruction of the form
+///
+/// ```asm
+/// <reg> = <reg>, <reg|imm>
+/// ```
+///
+/// This encompasses most of the arithmetic operations, including all
+/// multiplicative ones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumIter)]
 pub enum BasicOpcode {
+    /// Add two unsigned numbers together
     Add,
+    /// Bitwise AND
     And,
+    /// Bitwise AND while complementing (i.e., `!`) the first source register
     AndComplement,
-    Max,
+    /// Signed maximum of the two operands
+    MaxSigned,
+    /// Unsigned maximum of the two operands
     MaxUnsigned,
-    Min,
+    /// Signed minimum of the two operands
+    MinSigned,
+    /// Unsigned minimum of the two operands
     MinUnsigned,
+    /// Bitwise OR
     Or,
+    /// Bitwise OR while complementing (i.e., `!`) the first source register
     OrComplement,
+    /// Shift the first source left by 1 bit and add the other source
     Shift1Add,
+    /// Shift the first source left by 2 bits and add the other source
     Shift2Add,
+    /// Shift the first source left by 3 bits and add the other source
     Shift3Add,
+    /// Shift the first source left by 4 bits and add the other source
     Shift4Add,
+    /// Shift the first source left by `<src2>` number of bits
     ShiftLeft,
-    ShiftRight,
+    /// Shift the first source right by `<src2>` number of bits, retaining signedness
+    ShiftRightSigned,
+    /// Shift the first source right by `<src2>` number of bits
     ShiftRightUnsigned,
+    /// Bitwise XOR
     Xor,
-    MultiplyLowLow,
+    /// Multiply lower 16 bits of both **signed** sources
+    MultiplyLowLowSigned,
+    /// Multiply lower 16 bits of both **unsigned** sources
     MultiplyLowLowUnsigned,
-    MultiplyLowHigh,
+    /// Multiply lower 16 bits of the first source with the upper 16 bits
+    /// of the second source, treating both as **signed**
+    MultiplyLowHighSigned,
+    /// Multiply lower 16 bits of the first source with the upper 16 bits
+    /// of the second source, treating both as **unsigned**
     MultiplyLowHighUnsigned,
-    MultiplyHighHigh,
+    /// Multiply higher 16 bits of both **signed** sources
+    MultiplyHighHighSigned,
+    /// Multiply lower 16 bits of both **unsigned** sources
     MultiplyHighHighUnsigned,
-    MultiplyLow,
+    /// Multiply the lower 16 bits of the second source by the full 32 bits
+    /// of the first source, treating both as **signed**
+    MultiplyLowSigned,
+    /// Multiply the lower 16 bits of the second source by the full 32 bits
+    /// of the first source, treating both as **unsigned**
     MultiplyLowUnsigned,
-    MultiplyHigh,
+    /// Multiply the higher 16 bits of the second source by the full 32 bits
+    /// of the first source, treating both as **signed**
+    MultiplyHighSigned,
+    /// Multiply the higher 16 bits of the second source by the full 32 bits
+    /// of the first source, treating both as **unsigned**
     MultiplyHighUnsigned,
+    /// Multiply the higher 16 bits of the second source by the full 32 bits
+    /// of the first source, treating both as **signed**. However, this differs
+    /// from [`MultiplyHigh`](`BasicOpcode::MultiplyHigh`) in that the higher
+    /// 16 bits are shifted back into the higher position before multiplication
     MultiplyHighShift,
 }
 
 impl BasicOpcode {
+    /// The opcode for this basic operation
     pub const fn code(self) -> &'static str {
         match self {
             Self::Add => "add",
             Self::And => "and",
             Self::AndComplement => "andc",
-            Self::Max => "max",
+            Self::MaxSigned => "max",
             Self::MaxUnsigned => "maxu",
-            Self::Min => "min",
+            Self::MinSigned => "min",
             Self::MinUnsigned => "minu",
             Self::Or => "or",
             Self::OrComplement => "orc",
@@ -56,22 +105,23 @@ impl BasicOpcode {
             Self::Shift3Add => "sh3add",
             Self::Shift4Add => "sh4add",
             Self::ShiftLeft => "shl",
-            Self::ShiftRight => "shr",
+            Self::ShiftRightSigned => "shr",
             Self::ShiftRightUnsigned => "shru",
             Self::Xor => "xor",
-            Self::MultiplyLowLow => "mpyll",
+            Self::MultiplyLowLowSigned => "mpyll",
             Self::MultiplyLowLowUnsigned => "mpyllu",
-            Self::MultiplyLowHigh => "mpylh",
+            Self::MultiplyLowHighSigned => "mpylh",
             Self::MultiplyLowHighUnsigned => "mpylhu",
-            Self::MultiplyHighHigh => "mpyhh",
+            Self::MultiplyHighHighSigned => "mpyhh",
             Self::MultiplyHighHighUnsigned => "mpyhhu",
-            Self::MultiplyLow => "mpyl",
+            Self::MultiplyLowSigned => "mpyl",
             Self::MultiplyLowUnsigned => "mpylu",
-            Self::MultiplyHigh => "mpyh",
+            Self::MultiplyHighSigned => "mpyh",
             Self::MultiplyHighUnsigned => "mpyhu",
             Self::MultiplyHighShift => "mpyhs",
         }
     }
+    /// Execute the operation using the two 32-bit numbers
     pub fn execute(&self, a: u32, b: u32) -> u32 {
         const fn lower_signed(r: u32) -> i32 {
             (((r as i32) << 16) & (0xffff_0000_u32 as i32)) >> 16
@@ -83,19 +133,21 @@ impl BasicOpcode {
             Self::Add => a.wrapping_add(b),
             Self::And => a & b,
             Self::AndComplement => (!a) & b,
-            Self::Max => ((a as i32).max(b as i32)) as u32,
+            Self::MaxSigned => ((a as i32).max(b as i32)) as u32,
             Self::MaxUnsigned => a.max(b),
-            Self::Min => ((a as i32).min(b as i32)) as u32,
+            Self::MinSigned => ((a as i32).min(b as i32)) as u32,
             Self::MinUnsigned => a.min(b),
-            Self::MultiplyHigh => ((a as i32).wrapping_mul(higher_signed(b))) as u32,
-            Self::MultiplyHighHigh => (higher_signed(a).wrapping_mul(higher_signed(b))) as u32,
+            Self::MultiplyHighSigned => ((a as i32).wrapping_mul(higher_signed(b))) as u32,
+            Self::MultiplyHighHighSigned => {
+                (higher_signed(a).wrapping_mul(higher_signed(b))) as u32
+            }
             Self::MultiplyHighHighUnsigned => ((a >> 16) & 0xffff).wrapping_mul((b >> 16) & 0xffff),
             Self::MultiplyHighShift => a.wrapping_mul(((b >> 16) as i16) as u32),
             Self::MultiplyHighUnsigned => a.wrapping_mul((b >> 16) & 0xffff),
-            Self::MultiplyLow => ((a as i32).wrapping_mul(lower_signed(b))) as u32,
-            Self::MultiplyLowHigh => (lower_signed(a).wrapping_mul(higher_signed(b))) as u32,
+            Self::MultiplyLowSigned => ((a as i32).wrapping_mul(lower_signed(b))) as u32,
+            Self::MultiplyLowHighSigned => (lower_signed(a).wrapping_mul(higher_signed(b))) as u32,
             Self::MultiplyLowHighUnsigned => (a & 0xffff).wrapping_mul((b >> 16) & 0xffff),
-            Self::MultiplyLowLow => (lower_signed(a).wrapping_mul(lower_signed(b))) as u32,
+            Self::MultiplyLowLowSigned => (lower_signed(a).wrapping_mul(lower_signed(b))) as u32,
             Self::MultiplyLowLowUnsigned => (a & 0xffff).wrapping_mul(b & 0xffff),
             Self::MultiplyLowUnsigned => a.wrapping_mul(b & 0xffff),
             Self::Or => a | b,
@@ -105,22 +157,23 @@ impl BasicOpcode {
             Self::Shift3Add => (a << 3).wrapping_add(b),
             Self::Shift4Add => (a << 4).wrapping_add(b),
             Self::ShiftLeft => a << b,
-            Self::ShiftRight => ((a as i32) >> b) as u32,
+            Self::ShiftRightSigned => ((a as i32) >> b) as u32,
             Self::ShiftRightUnsigned => a >> b,
             Self::Xor => a ^ b,
         }
     }
+    /// Get the kind of this opcode
     pub const fn kind(self) -> Kind {
         match self {
-            Self::MultiplyHigh
-            | Self::MultiplyHighHigh
+            Self::MultiplyHighSigned
+            | Self::MultiplyHighHighSigned
             | Self::MultiplyHighHighUnsigned
             | Self::MultiplyHighShift
             | Self::MultiplyHighUnsigned
-            | Self::MultiplyLow
-            | Self::MultiplyLowHigh
+            | Self::MultiplyLowSigned
+            | Self::MultiplyLowHighSigned
             | Self::MultiplyLowHighUnsigned
-            | Self::MultiplyLowLow
+            | Self::MultiplyLowLowSigned
             | Self::MultiplyLowLowUnsigned
             | Self::MultiplyLowUnsigned => Kind::Multiplication,
             _ => Kind::Arithmetic,
@@ -135,9 +188,9 @@ impl FromStr for BasicOpcode {
             "add" => Self::Add,
             "and" => Self::And,
             "andc" => Self::AndComplement,
-            "max" => Self::Max,
+            "max" => Self::MaxSigned,
             "maxu" => Self::MaxUnsigned,
-            "min" => Self::Min,
+            "min" => Self::MinSigned,
             "minu" => Self::MinUnsigned,
             "or" => Self::Or,
             "orc" => Self::OrComplement,
@@ -146,18 +199,18 @@ impl FromStr for BasicOpcode {
             "sh3add" => Self::Shift3Add,
             "sh4add" => Self::Shift4Add,
             "shl" => Self::ShiftLeft,
-            "shr" => Self::ShiftRight,
+            "shr" => Self::ShiftRightSigned,
             "shru" => Self::ShiftRightUnsigned,
             "xor" => Self::Xor,
-            "mpyll" => Self::MultiplyLowLow,
+            "mpyll" => Self::MultiplyLowLowSigned,
             "mpyllu" => Self::MultiplyLowLowUnsigned,
-            "mpylh" => Self::MultiplyLowHigh,
+            "mpylh" => Self::MultiplyLowHighSigned,
             "mpylhu" => Self::MultiplyLowHighUnsigned,
-            "mpyhh" => Self::MultiplyHighHigh,
+            "mpyhh" => Self::MultiplyHighHighSigned,
             "mpyhhu" => Self::MultiplyHighHighUnsigned,
-            "mpyl" => Self::MultiplyLow,
+            "mpyl" => Self::MultiplyLowSigned,
             "mpylu" => Self::MultiplyLowUnsigned,
-            "mpyh" => Self::MultiplyHigh,
+            "mpyh" => Self::MultiplyHighSigned,
             "mpyhu" => Self::MultiplyHighUnsigned,
             "mpyhs" => Self::MultiplyHighShift,
             _ => return Err(()),
@@ -171,6 +224,11 @@ impl Display for BasicOpcode {
     }
 }
 
+/// Arguments that follow the basic structure
+///
+/// This structure encompasses most VEX commands; it consists of
+/// a destination register, a source register, and a second operand,
+/// which will either be an immediate value or a register.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BasicArgs {
     /// The first input register
@@ -187,13 +245,6 @@ impl FromStr for BasicArgs {
         let mut idx = 0;
         let s = trim_start(s, &mut idx);
         // Chomp the destination register
-        if s.starts_with('=') {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        }
         let Some((dst, s)) = s.split_once('=') else {
             return Err(WithContext {
                 source: ParseError::NoRegister,
@@ -202,13 +253,7 @@ impl FromStr for BasicArgs {
             });
         };
         let val_len = dst.len();
-        let dst: Register =
-            dst.parse()
-                .map_err(|r: WithContext<RegisterParseError>| WithContext {
-                    source: r.source.into(),
-                    ctx: r.span_context(idx),
-                    help: None,
-                })?;
+        let dst: Register = dst.parse().map_err(|r| reg_err(r, idx))?;
         if dst.class != RegisterType::General {
             return Err(WithContext {
                 source: ParseError::WrongRegisterType {
@@ -222,13 +267,6 @@ impl FromStr for BasicArgs {
         // We're past the =, trim and get the first register
         idx += val_len + 1;
         let s = trim_start(s, &mut idx);
-        if s.starts_with(',') {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        }
         let Some((src1, s)) = s.split_once(',') else {
             return Err(WithContext {
                 source: ParseError::NoRegister,
@@ -237,18 +275,12 @@ impl FromStr for BasicArgs {
             });
         };
         let val_len = src1.len();
-        let src1: Register =
-            src1.parse()
-                .map_err(|r: WithContext<RegisterParseError>| WithContext {
-                    source: r.source.into(),
-                    ctx: r.span_context(idx),
-                    help: None,
-                })?;
+        let src1: Register = src1.parse().map_err(|r| reg_err(r, idx))?;
         if src1.class != RegisterType::General {
             return Err(WithContext {
                 source: ParseError::WrongRegisterType {
                     wanted: RegisterType::General,
-                    got: dst.class,
+                    got: src1.class,
                 },
                 ctx: (idx, 0).into(),
                 help: None,
@@ -276,7 +308,7 @@ impl FromStr for BasicArgs {
                 return Err(WithContext {
                     source: ParseError::WrongRegisterType {
                         wanted: RegisterType::General,
-                        got: dst.class,
+                        got: r.class,
                     },
                     ctx: (idx, 0).into(),
                     help: None,
@@ -376,13 +408,6 @@ impl FromStr for CarryArgs {
         let mut idx = 0;
         let s = trim_start(s, &mut idx);
         // Chomp the first destination register
-        if s.starts_with(',') {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        }
         let Some((dst, s)) = s.split_once(',') else {
             return Err(WithContext {
                 source: ParseError::NoRegister,
@@ -391,13 +416,7 @@ impl FromStr for CarryArgs {
             });
         };
         let val_len = dst.len();
-        let dst: Register =
-            dst.parse()
-                .map_err(|r: WithContext<RegisterParseError>| WithContext {
-                    source: r.source.into(),
-                    ctx: r.span_context(idx),
-                    help: None,
-                })?;
+        let dst: Register = dst.parse().map_err(|r| reg_err(r, idx))?;
         if dst.class != RegisterType::General {
             return Err(WithContext {
                 source: ParseError::WrongRegisterType {
@@ -411,13 +430,6 @@ impl FromStr for CarryArgs {
         // We're past the ',', trim and get the second output register
         idx += val_len + 1;
         let s = trim_start(s, &mut idx);
-        if s.starts_with('=') {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        }
         let Some((cout, s)) = s.split_once('=') else {
             return Err(WithContext {
                 source: ParseError::NoRegister,
@@ -426,13 +438,7 @@ impl FromStr for CarryArgs {
             });
         };
         let val_len = cout.len();
-        let cout: Register =
-            cout.parse()
-                .map_err(|r: WithContext<RegisterParseError>| WithContext {
-                    source: r.source.into(),
-                    ctx: r.span_context(idx),
-                    help: None,
-                })?;
+        let cout: Register = cout.parse().map_err(|r| reg_err(r, idx))?;
         if cout.class != RegisterType::Branch {
             return Err(WithContext {
                 source: ParseError::WrongRegisterType {
@@ -446,13 +452,6 @@ impl FromStr for CarryArgs {
         idx += val_len + 1;
         let s = trim_start(s, &mut idx);
         // We're past the =, get the input registers
-        if s.starts_with(',') {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        }
         let Some((cin, s)) = s.split_once(',') else {
             return Err(WithContext {
                 source: ParseError::NoRegister,
@@ -461,13 +460,7 @@ impl FromStr for CarryArgs {
             });
         };
         let val_len = cin.len();
-        let cin: Register =
-            cin.parse()
-                .map_err(|r: WithContext<RegisterParseError>| WithContext {
-                    source: r.source.into(),
-                    ctx: r.span_context(idx),
-                    help: None,
-                })?;
+        let cin: Register = cin.parse().map_err(|r| reg_err(r, idx))?;
         if cin.class != RegisterType::Branch {
             return Err(WithContext {
                 source: ParseError::WrongRegisterType {
@@ -481,13 +474,6 @@ impl FromStr for CarryArgs {
         idx += val_len + 1;
         let s = trim_start(s, &mut idx);
         // Register s1
-        if s.starts_with(',') {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        }
         let Some((src1, s)) = s.split_once(',') else {
             return Err(WithContext {
                 source: ParseError::NoRegister,
@@ -496,18 +482,12 @@ impl FromStr for CarryArgs {
             });
         };
         let val_len = src1.len();
-        let src1: Register =
-            src1.parse()
-                .map_err(|r: WithContext<RegisterParseError>| WithContext {
-                    source: r.source.into(),
-                    ctx: r.span_context(idx),
-                    help: None,
-                })?;
+        let src1: Register = src1.parse().map_err(|r| reg_err(r, idx))?;
         if src1.class != RegisterType::General {
             return Err(WithContext {
                 source: ParseError::WrongRegisterType {
                     wanted: RegisterType::General,
-                    got: dst.class,
+                    got: src1.class,
                 },
                 ctx: (idx, 0).into(),
                 help: None,
@@ -525,18 +505,12 @@ impl FromStr for CarryArgs {
             });
         };
         let val_len = src2.len();
-        let src2: Register =
-            src2.parse()
-                .map_err(|r: WithContext<RegisterParseError>| WithContext {
-                    source: r.source.into(),
-                    ctx: r.span_context(idx),
-                    help: None,
-                })?;
+        let src2: Register = src2.parse().map_err(|r| reg_err(r, idx))?;
         if src2.class != RegisterType::General {
             return Err(WithContext {
                 source: ParseError::WrongRegisterType {
                     wanted: RegisterType::General,
-                    got: dst.class,
+                    got: src2.class,
                 },
                 ctx: (idx, 0).into(),
                 help: None,
@@ -660,13 +634,6 @@ impl FromStr for SubArgs {
         let mut idx = 0;
         let s = trim_start(s, &mut idx);
         // Chomp the destination register
-        if s.starts_with('=') {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        }
         let Some((dst, s)) = s.split_once('=') else {
             return Err(WithContext {
                 source: ParseError::NoRegister,
@@ -675,13 +642,7 @@ impl FromStr for SubArgs {
             });
         };
         let val_len = dst.len();
-        let dst: Register =
-            dst.parse()
-                .map_err(|r: WithContext<RegisterParseError>| WithContext {
-                    source: r.source.into(),
-                    ctx: r.span_context(idx),
-                    help: None,
-                })?;
+        let dst: Register = dst.parse().map_err(|r| reg_err(r, idx))?;
         if dst.class != RegisterType::General {
             return Err(WithContext {
                 source: ParseError::WrongRegisterType {
@@ -692,16 +653,9 @@ impl FromStr for SubArgs {
                 help: None,
             });
         }
-        // We're past the =, trim and get the first operand
+        // We're past the =, trim and get the first operand (either register or immediate)
         idx += val_len + 1;
         let s = trim_start(s, &mut idx);
-        if s.starts_with(',') {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        }
         let Some((src1, s)) = s.split_once(',') else {
             return Err(WithContext {
                 source: ParseError::NoRegister,
@@ -720,7 +674,7 @@ impl FromStr for SubArgs {
                 return Err(WithContext {
                     source: ParseError::WrongRegisterType {
                         wanted: RegisterType::General,
-                        got: dst.class,
+                        got: r.class,
                     },
                     ctx: (idx, 0).into(),
                     help: None,
@@ -728,7 +682,7 @@ impl FromStr for SubArgs {
             }
         }
         idx += val_len + 1;
-        // We're past the , this could either be a register or an immediate
+        // We're past the first operand. At this point it better be a register
         let mut splitter = s.split_whitespace();
         let Some(src2) = splitter.next() else {
             return Err(WithContext {
@@ -738,18 +692,12 @@ impl FromStr for SubArgs {
             });
         };
         let val_len = src2.len();
-        let src2: Register =
-            src2.parse()
-                .map_err(|r: WithContext<RegisterParseError>| WithContext {
-                    source: r.source.into(),
-                    ctx: r.span_context(idx),
-                    help: None,
-                })?;
+        let src2: Register = src2.parse().map_err(|r| reg_err(r, idx))?;
         if src2.class != RegisterType::General {
             return Err(WithContext {
                 source: ParseError::WrongRegisterType {
                     wanted: RegisterType::General,
-                    got: dst.class,
+                    got: src2.class,
                 },
                 ctx: (idx, 0).into(),
                 help: None,
@@ -851,13 +799,6 @@ impl FromStr for ExtendArgs {
         let mut idx = 0;
         let s = trim_start(s, &mut idx);
         // Chomp the destination register
-        if s.starts_with('=') {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        }
         let Some((dst, s)) = s.split_once('=') else {
             return Err(WithContext {
                 source: ParseError::NoRegister,
@@ -866,13 +807,7 @@ impl FromStr for ExtendArgs {
             });
         };
         let val_len = dst.len();
-        let dst: Register =
-            dst.parse()
-                .map_err(|r: WithContext<RegisterParseError>| WithContext {
-                    source: r.source.into(),
-                    ctx: r.span_context(idx),
-                    help: None,
-                })?;
+        let dst: Register = dst.parse().map_err(|r| reg_err(r, idx))?;
         if dst.class != RegisterType::General {
             return Err(WithContext {
                 source: ParseError::WrongRegisterType {
@@ -891,22 +826,16 @@ impl FromStr for ExtendArgs {
             return Err(WithContext {
                 source: ParseError::NoRegister,
                 ctx: (idx, 0).into(),
-                help: Some(String::from("Sign extension requires exactly one register")),
+                help: None,
             });
         };
         let val_len = src.len();
-        let src: Register =
-            src.parse()
-                .map_err(|r: WithContext<RegisterParseError>| WithContext {
-                    source: r.source.into(),
-                    ctx: r.span_context(idx),
-                    help: None,
-                })?;
+        let src: Register = src.parse().map_err(|r| reg_err(r, idx))?;
         if src.class != RegisterType::General {
             return Err(WithContext {
                 source: ParseError::WrongRegisterType {
                     wanted: RegisterType::General,
-                    got: dst.class,
+                    got: src.class,
                 },
                 ctx: (idx, 0).into(),
                 help: None,
