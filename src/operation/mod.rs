@@ -1,4 +1,4 @@
-use std::{fmt::Display, num::ParseIntError, str::FromStr, sync::LazyLock};
+use std::{borrow::Cow, fmt::Display, num::ParseIntError, str::FromStr, sync::LazyLock};
 
 use fuzzy_matcher::clangd::fuzzy_match;
 use memory::LoadOpcode;
@@ -10,6 +10,7 @@ use thiserror::Error;
 use crate::{Machine, Outcome, Resource};
 
 mod arithmetic;
+mod intercluster;
 mod memory;
 
 const COMMENT_START: char = '#';
@@ -17,7 +18,7 @@ const COMMENT_START: char = '#';
 /// Trait for providing information about an operation
 trait Info: Display {
     /// The opcodes these arguments support
-    type Opcode;
+    type Opcode: Copy;
     /// Decode the instruction into the output. The implementation is expected
     /// to return an error if an input **or** an output would cause issues (e.g.,
     /// misalignment or register out of bounds)
@@ -322,6 +323,7 @@ pub enum Action {
     Load(memory::LoadOpcode, memory::LoadArgs),
     Store(memory::StoreOpcode, memory::StoreArgs),
     Extend(arithmetic::ExtendOpcode, arithmetic::ExtendArgs),
+    Move(intercluster::MoveArgs),
 }
 
 /// Trim the start, and update the idx to point at the new start
@@ -377,16 +379,19 @@ pub enum ParseError {
 }
 
 impl ParseError {
-    pub const fn element(&self) -> &'static str {
+    pub fn element(&self) -> Cow<'static, str> {
         match self {
-            Self::NoCluster => "cluster",
-            Self::NoOpcode | Self::UnknownOpcode(_) => "opcode",
+            Self::NoCluster => Cow::Borrowed("cluster"),
+            Self::NoOpcode | Self::UnknownOpcode(_) => Cow::Borrowed("opcode"),
             Self::NoRegister
             | Self::BadRegister(_)
-            | Self::WrongRegisterType { got: _, wanted: _ } => "register",
-            Self::NoOffset | Self::BadOffset(_) => "offset",
-            Self::NoValue | Self::BadOperand(_, _) => "value",
-            Self::ExpectedEnd(_) | Self::UnexpectedCharacter { wanted: _, got: _ } => "problem",
+            | Self::WrongRegisterType { got: _, wanted: _ } => Cow::Borrowed("register"),
+            Self::NoOffset | Self::BadOffset(_) => Cow::Borrowed("offset"),
+            Self::NoValue | Self::BadOperand(_, _) => Cow::Borrowed("value"),
+            Self::ExpectedEnd(_) => Cow::Borrowed("problem"),
+            Self::UnexpectedCharacter { wanted, got: _ } => {
+                Cow::Owned(format!("Expected '{wanted}'"))
+            }
         }
     }
 }
@@ -409,7 +414,7 @@ impl FromStr for Action {
             return Err(WithContext {
                 source: ParseError::NoOpcode,
                 ctx: (idx, 0).into(),
-                help: None,
+                help: Some(String::from("All instructions must begin with a cluster, and then an opcode (e.g., `add`, `ldw`, ...)")),
             });
         };
         let opcode = cap.as_str();
@@ -419,7 +424,7 @@ impl FromStr for Action {
             WithContext {
                 source: p.source,
                 ctx: span,
-                help: None,
+                help: p.help,
             }
         };
         if let Ok(ar_opcode) = opcode.parse::<arithmetic::BasicOpcode>() {
@@ -434,6 +439,8 @@ impl FromStr for Action {
             Ok(Self::Extend(ex_opcode, rest.parse().map_err(err)?))
         } else if opcode == "sub" {
             Ok(Self::Sub(rest.parse().map_err(err)?))
+        } else if opcode == "mov" {
+            Ok(Self::Move(rest.parse().map_err(err)?))
         } else {
             // No matched op code
             let help = arithmetic::BasicOpcode::iter()
@@ -461,6 +468,7 @@ impl Action {
             Self::Extend(_, args) => args.inputs(),
             Self::Load(_, load) => load.inputs(),
             Self::Store(_, store) => store.inputs(),
+            Self::Move(args) => args.inputs(),
         }
     }
     pub fn outputs(&self) -> Vec<Location> {
@@ -471,6 +479,7 @@ impl Action {
             Self::CarryArithmetic(_, args) => args.outputs(),
             Self::Load(_, load) => load.outputs(),
             Self::Store(_, store) => store.outputs(),
+            Self::Move(args) => args.outputs(),
         }
     }
     pub fn decode(&self, machine: &Machine) -> Result<Vec<Outcome>, DecodeError> {
@@ -481,6 +490,7 @@ impl Action {
             Self::CarryArithmetic(op, args) => args.decode(*op, machine),
             Self::Load(op, args) => args.decode(*op, machine),
             Self::Store(op, args) => args.decode(*op, machine),
+            Self::Move(args) => args.decode((), machine),
         }
     }
     pub const fn code(&self) -> &'static str {
@@ -491,13 +501,14 @@ impl Action {
             Self::CarryArithmetic(op, _) => op.code(),
             Self::Load(op, _) => op.code(),
             Self::Store(op, _) => op.code(),
+            Self::Move(_) => "mov",
         }
     }
     pub const fn kind(&self) -> Kind {
         match self {
             Self::BasicArithmetic(op, _) => op.kind(),
             Self::CarryArithmetic(op, _) => op.kind(),
-            Self::Sub(_)|Self::Extend(_, _) => Kind::Arithmetic,
+            Self::Sub(_) | Self::Extend(_, _) | Self::Move(_) => Kind::Arithmetic,
             Self::Load(_, _) => Kind::Load,
             Self::Store(_, _) => Kind::Store,
         }
@@ -510,6 +521,7 @@ impl Display for Action {
             Self::BasicArithmetic(op, args) => f.write_fmt(format_args!("{op} {args}")),
             Self::CarryArithmetic(op, args) => f.write_fmt(format_args!("{op} {args}")),
             Self::Sub(args) => f.write_fmt(format_args!("sub {args}")),
+            Self::Move(args) => f.write_fmt(format_args!("mov {args}")),
             Self::Extend(op, args) => f.write_fmt(format_args!("{op} {args}")),
             Self::Load(op, args) => f.write_fmt(format_args!("{op} {args}")),
             Self::Store(op, args) => f.write_fmt(format_args!("{op} {args}")),
@@ -594,7 +606,7 @@ impl FromStr for Operation {
 }
 
 impl Operation {
-    pub const fn with_context(self, ctx: (usize, SourceSpan)) -> Self {
+    pub fn with_context(self, ctx: (usize, SourceSpan)) -> Self {
         Self {
             ctx: Some(ctx),
             ..self
