@@ -4,8 +4,8 @@ use clap::Parser;
 use machine::{Machine, MemoryValue, Violation, OUTPUT_REG};
 use miette::{Diagnostic, IntoDiagnostic, NamedSource, SourceSpan};
 use operation::WithContext;
-use std::fmt::Display;
 use std::fs;
+use std::{borrow::Cow, fmt::Display};
 use thiserror::Error;
 
 mod machine;
@@ -173,7 +173,7 @@ struct ExecutionDiagnostic {
 #[derive(Error, Debug, Clone, PartialEq, Eq, Diagnostic)]
 #[error("Parsing Failure")]
 struct ParseDiagnostic {
-    element: &'static str,
+    element: Cow<'static, str>,
     source: ParseError,
     #[label = "{element}"]
     problem: SourceSpan,

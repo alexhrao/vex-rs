@@ -834,7 +834,7 @@ impl FromStr for ExtendOpcode {
             "sxth" => Self::Half,
             "zxtb" => Self::ZeroByte,
             "zxth" => Self::ZeroHalf,
-            _ => return Err(())
+            _ => return Err(()),
         })
     }
 }
