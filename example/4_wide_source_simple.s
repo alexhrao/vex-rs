@@ -169,7 +169,6 @@ main::
 	c0    add $r0.8 = $r0.8, $r0.7 ## bblock 10, line 21,  t113,  t53,  t107
 ;;
 	c0    add $r0.7 = $r0.2, $r0.7 ## bblock 10, line 17,  t108,  t16,  t107
-	c0    add $r0.7 = $r0.2, $r0.7 ## bblock 10, line 17,  t108,  t16,  t107
 ;;
 	c0    ldw $r0.10 = 0x18[$r0.1] ## restore ## t4
 	c0    mpylu $r0.11 = $r0.9, $r0.6 ## bblock 10, line 20,  t111,  t8,  t12

@@ -3,8 +3,7 @@ use std::{fmt::Display, str::FromStr};
 use crate::{operation::Alignment, Location, Machine, Outcome};
 
 use super::{
-    parse_num, reg_err, trim_start, DecodeError, Info, ParseError, Register, RegisterParseError,
-    RegisterType, WithContext,
+    check_cluster, parse_num, reg_err, trim_start, DecodeError, Info, ParseError, Register, RegisterClass, RegisterParseError, WithContext
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumIter)]
@@ -80,10 +79,10 @@ impl FromStr for LoadArgs {
         };
         let val_len = dst.len();
         let dst: Register = dst.parse().map_err(|r| reg_err(r, idx))?;
-        if dst.class != RegisterType::General {
+        if dst.class != RegisterClass::General {
             return Err(WithContext {
-                source: ParseError::WrongRegisterType {
-                    wanted: RegisterType::General,
+                source: ParseError::WrongRegisterClass {
+                    wanted: RegisterClass::General,
                     got: dst.class,
                 },
                 ctx: (idx, 0).into(),
@@ -124,17 +123,18 @@ impl FromStr for LoadArgs {
                     ctx: e.span_context(idx),
                     help: None,
                 })?;
-        idx += val_len + 1;
-        if base.class != RegisterType::General {
+        if base.class != RegisterClass::General {
             return Err(WithContext {
-                source: ParseError::WrongRegisterType {
-                    wanted: RegisterType::General,
+                source: ParseError::WrongRegisterClass {
+                    wanted: RegisterClass::General,
                     got: base.class,
                 },
                 ctx: (idx, 0).into(),
                 help: None,
             });
         }
+        check_cluster(dst, base, idx, val_len)?;
+        idx += val_len + 1;
         let s = trim_start(s, &mut idx);
         if !s.is_empty() {
             Err(WithContext {
@@ -266,10 +266,10 @@ impl FromStr for StoreArgs {
                     ctx: e.span_context(idx),
                     help: None,
                 })?;
-        if base.class != RegisterType::General {
+        if base.class != RegisterClass::General {
             return Err(WithContext {
-                source: ParseError::WrongRegisterType {
-                    wanted: RegisterType::General,
+                source: ParseError::WrongRegisterClass {
+                    wanted: RegisterClass::General,
                     got: base.class,
                 },
                 ctx: (idx, 0).into(),
@@ -303,16 +303,17 @@ impl FromStr for StoreArgs {
 
         let val_len = src.len();
         let src: Register = src.parse().map_err(|r| reg_err(r, idx))?;
-        if src.class != RegisterType::General {
+        if src.class != RegisterClass::General {
             return Err(WithContext {
-                source: ParseError::WrongRegisterType {
-                    wanted: RegisterType::General,
+                source: ParseError::WrongRegisterClass {
+                    wanted: RegisterClass::General,
                     got: src.class,
                 },
                 ctx: (idx, 0).into(),
                 help: None,
             });
         }
+        check_cluster(base, src, idx, val_len)?;
         idx += val_len + 1;
         let s = trim_start(splitter.next().unwrap_or_default(), &mut idx);
         if !s.is_empty() {
@@ -357,7 +358,7 @@ impl Display for StoreArgs {
 #[cfg(test)]
 mod test {
 
-    use crate::operation::{Register, RegisterType};
+    use crate::operation::{Register, RegisterClass};
 
     use super::{LoadArgs, StoreArgs};
 
@@ -370,13 +371,15 @@ mod test {
                 " $r0.4 = 0x20 [ $r0.1]",
                 LoadArgs {
                     base: Register {
+                        cluster: 0,
                         num: 1,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                     offset: 0x20,
                     dst: Register {
+                        cluster: 0,
                         num: 4,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                 },
             ),
@@ -384,13 +387,15 @@ mod test {
                 "$r0.4=5[$r0.1]",
                 LoadArgs {
                     base: Register {
+                        cluster: 0,
                         num: 1,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                     offset: 5,
                     dst: Register {
+                        cluster: 0,
                         num: 4,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                 },
             ),
@@ -398,13 +403,15 @@ mod test {
                 "        $r0.4       = 5     [$r0.1]    ",
                 LoadArgs {
                     base: Register {
+                        cluster: 0,
                         num: 1,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                     offset: 5,
                     dst: Register {
+                        cluster: 0,
                         num: 4,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                 },
             ),
@@ -417,6 +424,7 @@ mod test {
             "$r0.2 = 0x24[r0.1]",
             "$r0.2 = 0x24[$b0.1]",
             "$r0.2 = [$r0.1]",
+            "$r0.2 = 0x00[$r1.1]",
             "$r0.2 = 0x24[]",
             "= 0x24[$r0.1]",
         ]);
@@ -429,11 +437,13 @@ mod test {
                 "$r0.2 = 0x24[$r0.1]",
                 LoadArgs {
                     base: Register {
-                        class: RegisterType::General,
+                        cluster: 0,
+                        class: RegisterClass::General,
                         num: 1,
                     },
                     dst: Register {
-                        class: RegisterType::General,
+                        cluster: 0,
+                        class: RegisterClass::General,
                         num: 2,
                     },
                     offset: 0x24,
@@ -443,11 +453,13 @@ mod test {
                 "$r0.2 = 0x01[$r0.1]",
                 LoadArgs {
                     base: Register {
-                        class: RegisterType::General,
+                        cluster: 0,
+                        class: RegisterClass::General,
                         num: 1,
                     },
                     dst: Register {
-                        class: RegisterType::General,
+                        cluster: 0,
+                        class: RegisterClass::General,
                         num: 2,
                     },
                     offset: 0x1,
@@ -463,13 +475,15 @@ mod test {
                 "0x20[$r0.1]=$r0.4",
                 StoreArgs {
                     base: Register {
+                        cluster: 0,
                         num: 1,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                     offset: 0x20,
                     src: Register {
+                        cluster: 0,
                         num: 4,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                 },
             ),
@@ -477,13 +491,15 @@ mod test {
                 "   5      [ $r0.1      ]    =        $r0.4   ",
                 StoreArgs {
                     base: Register {
+                        cluster: 0,
                         num: 1,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                     offset: 5,
                     src: Register {
+                        cluster: 0,
                         num: 4,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                 },
             ),
@@ -491,6 +507,7 @@ mod test {
 
         negative::<StoreArgs, _>(&[
             "0x24[$r0.1] = $r0.2  f",
+            "0x24[$r0.1] = $r1.2",
             "0xg24[$r0.1] = $r0.2",
             "0x24[r0.1] =' $r0.2",
             "0x24[$b0.1] = $r0.2",
@@ -507,11 +524,13 @@ mod test {
                 "0x01[$r0.1] = $r0.2",
                 StoreArgs {
                     base: Register {
-                        class: RegisterType::General,
+                        cluster: 0,
+                        class: RegisterClass::General,
                         num: 1,
                     },
                     src: Register {
-                        class: RegisterType::General,
+                        cluster: 0,
+                        class: RegisterClass::General,
                         num: 2,
                     },
                     offset: 1,
@@ -521,11 +540,13 @@ mod test {
                 "0x24[$r0.1] = $r0.2",
                 StoreArgs {
                     base: Register {
-                        class: RegisterType::General,
+                        cluster: 0,
+                        class: RegisterClass::General,
                         num: 1,
                     },
                     src: Register {
-                        class: RegisterType::General,
+                        cluster: 0,
+                        class: RegisterClass::General,
                         num: 2,
                     },
                     offset: 0x24,

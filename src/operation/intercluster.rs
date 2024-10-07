@@ -3,7 +3,7 @@ use std::{fmt::Display, str::FromStr};
 use crate::{machine::Machine, operation::Location, Outcome};
 
 use super::{
-    help, parse_num, reg_err, trim_start, DecodeError, Info, ParseError, Register, RegisterType,
+    help, parse_num, reg_err, trim_start, DecodeError, Info, ParseError, Register, RegisterClass,
     UnexpectedValue, WithContext,
 };
 
@@ -31,10 +31,10 @@ impl FromStr for MoveArgs {
         };
         let val_len = dst.len();
         let dst: Register = dst.parse().map_err(|r| reg_err(r, idx))?;
-        if dst.class != RegisterType::General {
+        if dst.class != RegisterClass::General {
             return Err(WithContext {
-                source: ParseError::WrongRegisterType {
-                    wanted: RegisterType::General,
+                source: ParseError::WrongRegisterClass {
+                    wanted: RegisterClass::General,
                     got: dst.class,
                 },
                 ctx: (idx, 0).into(),

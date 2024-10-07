@@ -4,3 +4,4 @@ pub(super) const BAD_CLUSTER: &str = "Clusters must begin with the letter `c`";
 pub(super) const NO_CLUSTER: &str = "All instructions must begin with a cluster";
 pub(super) const BAD_PAYLOAD: &str =
     "This instruction requires a payload in matching parentheses, like (_?STRINGPACKET.1...)";
+pub(super) const CLUSTER_MISMATCH: &str = "This instruction only supports registers in a single cluster. Have you considered using SEND & RECV?";

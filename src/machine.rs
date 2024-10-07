@@ -10,20 +10,22 @@ use std::{
 use strum::IntoEnumIterator;
 
 use crate::{
-    operation::{Alignment, DecodeError, Kind, Location, Operation, Register, RegisterType},
+    operation::{Alignment, DecodeError, Kind, Location, Operation, Register, RegisterClass},
     Args, Outcome, ParameterError, Resource,
 };
 
 /// The zero register. This one should **never** be written to
 pub const ZERO_REG: Register = Register {
+    cluster: 0,
     num: 0,
-    class: RegisterType::General,
+    class: RegisterClass::General,
 };
 
 /// The output register. This is where the final numeric result goes
 pub const OUTPUT_REG: Register = Register {
+    cluster: 0,
     num: 4,
-    class: RegisterType::General,
+    class: RegisterClass::General,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -196,12 +198,15 @@ impl From<&[u8]> for MemoryValue {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct Cluster {
+    general: Vec<u32>,
+    branch: Vec<u32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Machine<'a> {
-    /// General-purpose registers
-    gregs: Vec<u32>,
-    /// Branch registers
-    bregs: Vec<u32>,
+    clusters: Vec<Cluster>,
     /// Memory
     mem: Vec<u8>,
     alus: Vec<Issued<'a>>,
@@ -230,20 +235,22 @@ pub struct Machine<'a> {
 impl<'a> Index<Register> for Machine<'a> {
     type Output = u32;
     fn index(&self, index: Register) -> &Self::Output {
+        let cluster = &self.clusters[index.cluster];
         match index.class {
-            RegisterType::Branch => &self.bregs[index.num],
-            RegisterType::General => &self.gregs[index.num],
-            RegisterType::Link => todo!(),
+            RegisterClass::Branch => &cluster.branch[index.num],
+            RegisterClass::General => &cluster.general[index.num],
+            RegisterClass::Link => todo!(),
         }
     }
 }
 
 impl<'a> IndexMut<Register> for Machine<'a> {
     fn index_mut(&mut self, index: Register) -> &mut Self::Output {
+        let cluster = &mut self.clusters[index.cluster];
         match index.class {
-            RegisterType::Branch => &mut self.bregs[index.num],
-            RegisterType::General => &mut self.gregs[index.num],
-            RegisterType::Link => todo!(),
+            RegisterClass::Branch => &mut cluster.branch[index.num],
+            RegisterClass::General => &mut cluster.general[index.num],
+            RegisterClass::Link => todo!(),
         }
     }
 }
@@ -282,10 +289,15 @@ impl<'a> Machine<'a> {
         }
     }
     pub fn get_reg(&self, r: Register) -> Result<u32, DecodeError> {
+        let c = self
+            .clusters
+            .get(r.cluster)
+            .ok_or(DecodeError::InvalidRegister(r))?;
+
         match r.class {
-            RegisterType::Branch => self.bregs.get(r.num),
-            RegisterType::General => self.gregs.get(r.num),
-            RegisterType::Link => todo!(),
+            RegisterClass::Branch => c.branch.get(r.num),
+            RegisterClass::General => c.general.get(r.num),
+            RegisterClass::Link => todo!(),
         }
         .copied()
         .ok_or(DecodeError::InvalidRegister(r))
@@ -549,72 +561,42 @@ impl<'a> Display for Machine<'a> {
 impl<'a> TryFrom<&Args> for Machine<'a> {
     type Error = ParameterError;
     fn try_from(args: &Args) -> Result<Self, Self::Error> {
-        if args.mem_size < 4 {
-            return Err(ParameterError::NotEnoughMemory(args.mem_size));
+        if args.mem_size.get() < 4 {
+            return Err(ParameterError::NotEnoughMemory(args.mem_size.get()));
         }
-        if (args.mem_size % 4) != 0 {
-            return Err(ParameterError::BadMemoryAlign(args.mem_size));
-        }
-        if args.num_regs < 1 {
-            return Err(ParameterError::NotEnoughRegisters);
-        }
-        if args.num_bregs < 1 {
-            return Err(ParameterError::NotEnoughBranchRegisters);
-        }
-        if args.num_slots == 0 {
-            return Err(ParameterError::NotEnoughSlots);
-        }
-        if args.mul_slots == 0 {
-            return Err(ParameterError::NotEnoughUnit(Resource::Mul));
-        }
-        if args.alu_slots == 0 {
-            return Err(ParameterError::NotEnoughUnit(Resource::Alu));
-        }
-        if args.load_slots == 0 {
-            return Err(ParameterError::NotEnoughUnit(Resource::Load));
-        }
-        if args.store_slots == 0 {
-            return Err(ParameterError::NotEnoughUnit(Resource::Store));
-        }
-        if args.load_latency == 0 {
-            return Err(ParameterError::ZeroLatency(Kind::Load));
-        }
-        if args.alu_latency == 0 {
-            return Err(ParameterError::ZeroLatency(Kind::Arithmetic));
-        }
-        if args.store_latency == 0 {
-            return Err(ParameterError::ZeroLatency(Kind::Store));
-        }
-        if args.mul_latency == 0 {
-            return Err(ParameterError::ZeroLatency(Kind::Multiplication));
+        if (args.mem_size.get() % 4) != 0 {
+            return Err(ParameterError::BadMemoryAlign(args.mem_size.get()));
         }
         if args.nums.len() != 10 {
             return Err(ParameterError::InvalidArguments(args.nums.len()));
         }
-        let mut mem = vec![0u8; args.mem_size];
-        let mut regs = vec![0u32; args.num_regs + 1];
+        let mut mem = vec![0u8; args.mem_size.get()];
+        let mut regs = vec![0u32; args.num_regs.get() + 1];
         for (m, n) in (0x18..=0x2c).step_by(4).zip(args.nums.iter().skip(1)) {
             mem[m..m + 4].copy_from_slice(&n.to_be_bytes());
         }
         mem[0x30..0x34].copy_from_slice(&args.nums[8].to_be_bytes());
         regs[3] = args.nums[9];
+        let cluster = Cluster {
+            branch: vec![0u32; args.num_bregs.get()],
+            general: regs,
+        };
         Ok(Machine {
             mem,
-            gregs: regs,
-            bregs: vec![0u32; args.num_bregs],
-            num_slots: args.num_slots,
-            num_alus: args.alu_slots,
-            alu_latency: args.alu_latency,
-            num_muls: args.mul_slots,
-            mul_latency: args.mul_latency,
-            num_loads: args.load_slots,
-            num_stores: args.store_slots,
-            load_latency: args.load_latency,
-            store_latency: args.store_latency,
-            alus: Vec::with_capacity(args.alu_slots),
-            loads: Vec::with_capacity(args.load_slots),
-            stores: Vec::with_capacity(args.store_slots),
-            muls: Vec::with_capacity(args.mul_slots),
+            clusters: vec![cluster],
+            num_slots: args.num_slots.get(),
+            num_alus: args.alu_slots.get(),
+            alu_latency: args.alu_latency.get(),
+            num_muls: args.mul_slots.get(),
+            mul_latency: args.mul_latency.get(),
+            num_loads: args.load_slots.get(),
+            num_stores: args.store_slots.get(),
+            load_latency: args.load_latency.get(),
+            store_latency: args.store_latency.get(),
+            alus: Vec::with_capacity(args.alu_slots.get()),
+            loads: Vec::with_capacity(args.load_slots.get()),
+            stores: Vec::with_capacity(args.store_slots.get()),
+            muls: Vec::with_capacity(args.mul_slots.get()),
             pending_reads: HashMap::new(),
             pending_writes: HashMap::new(),
         })
@@ -625,11 +607,13 @@ impl<'a> TryFrom<&Args> for Machine<'a> {
 pub(crate) mod test {
     use std::collections::HashMap;
 
-    use super::Machine;
+    use super::{Cluster, Machine};
     pub fn test_machine<'a>() -> Machine<'a> {
         Machine {
-            gregs: vec![0u32; 128],
-            bregs: vec![0u32; 128],
+            clusters: vec![Cluster {
+                general: vec![0u32; 128],
+                branch: vec![0u32; 128],
+            }],
             mem: vec![0u8; 4096],
             alus: vec![],
             muls: vec![],

@@ -162,13 +162,13 @@ impl FromStr for Operand {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RegisterType {
+pub enum RegisterClass {
     General,
     Branch,
     Link,
 }
 
-impl FromStr for RegisterType {
+impl FromStr for RegisterClass {
     type Err = ();
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
@@ -180,7 +180,7 @@ impl FromStr for RegisterType {
     }
 }
 
-impl Display for RegisterType {
+impl Display for RegisterClass {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::General => "r",
@@ -192,14 +192,19 @@ impl Display for RegisterType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Register {
+    pub(crate) cluster: usize,
     pub(crate) num: usize,
-    pub(crate) class: RegisterType,
+    pub(crate) class: RegisterClass,
 }
 
 impl Display for Register {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Self { num, class: bank } = self;
-        f.write_fmt(format_args!("${bank}0.{num}"))
+        let Self {
+            cluster,
+            num,
+            class,
+        } = self;
+        f.write_fmt(format_args!("${class}{cluster}.{num}"))
     }
 }
 
@@ -237,7 +242,7 @@ impl FromStr for Register {
         let s = &s[1..];
         idx += 1;
         // Chomp the register type
-        let Some(Ok(bank)) = s.chars().next().map(|c| c.to_string().parse()) else {
+        let Some(Ok(class)) = s.chars().next().map(|c| c.to_string().parse()) else {
             return Err(WithContext {
                 source: RegisterParseError::Class,
                 ctx: (idx, 0).into(),
@@ -246,27 +251,23 @@ impl FromStr for Register {
         };
         let s = &s[1..];
         idx += 1;
-        if !s.starts_with('0') {
+        // Chomp the cluster
+        let Some((cluster, s)) = s.split_once('.') else {
             return Err(WithContext {
                 source: RegisterParseError::Cluster,
                 ctx: (idx, 0).into(),
-                help: None,
+                help: Some("All registers must have a cluster".into()),
             });
-        }
-        let s = &s[1..];
-        idx += 1;
-        if !s.starts_with('.') {
+        };
+        let val_len = cluster.len();
+        idx += val_len + 1;
+        let Ok(cluster) = cluster.parse() else {
             return Err(WithContext {
-                source: RegisterParseError::UnexpectedChar {
-                    got: UnexpectedValue(s.chars().next()),
-                    expected: '.',
-                },
+                source: RegisterParseError::Cluster,
+                ctx: (idx, val_len).into(),
                 help: None,
-                ctx: (idx, 0).into(),
             });
-        }
-        let s = &s[1..];
-        idx += 1;
+        };
         let s = trim_start(s, &mut idx).trim();
         let Ok(num) = s.parse() else {
             return Err(WithContext {
@@ -275,7 +276,11 @@ impl FromStr for Register {
                 help: None,
             });
         };
-        Ok(Self { num, class: bank })
+        Ok(Self {
+            cluster,
+            num,
+            class,
+        })
     }
 }
 
@@ -370,10 +375,14 @@ pub enum ParseError {
     #[error("Failed to parse register: {0}")]
     BadRegister(RegisterParseError),
     #[error("Wrong register type: Wanted {wanted}, but got {got} instead")]
-    WrongRegisterType {
-        wanted: RegisterType,
-        got: RegisterType,
+    WrongRegisterClass {
+        wanted: RegisterClass,
+        got: RegisterClass,
     },
+    #[error(
+        "Cluster {0} found, but so was cluster {1}. This instruction only supports one cluster"
+    )]
+    RegisterClusterMismatch(usize, usize),
     #[error("Expected an offset, but none was found")]
     NoOffset,
     #[error("Failed to parse offset: {0}")]
@@ -393,11 +402,11 @@ pub enum ParseError {
 impl ParseError {
     pub fn element(&self) -> Cow<'static, str> {
         match self {
-            Self::NoCluster => Cow::Borrowed("cluster"),
+            Self::NoCluster | Self::RegisterClusterMismatch(_, _) => Cow::Borrowed("cluster"),
             Self::NoOpcode | Self::UnknownOpcode(_) => Cow::Borrowed("opcode"),
             Self::NoRegister
             | Self::BadRegister(_)
-            | Self::WrongRegisterType { got: _, wanted: _ } => Cow::Borrowed("register"),
+            | Self::WrongRegisterClass { got: _, wanted: _ } => Cow::Borrowed("register"),
             Self::NoOffset | Self::BadOffset(_) => Cow::Borrowed("offset"),
             Self::NoValue | Self::BadOperand(_, _) | Self::BadImmediate(_) => {
                 Cow::Borrowed("value")
@@ -413,6 +422,23 @@ impl ParseError {
 impl From<RegisterParseError> for ParseError {
     fn from(value: RegisterParseError) -> Self {
         Self::BadRegister(value)
+    }
+}
+
+fn check_cluster(
+    r1: Register,
+    r2: Register,
+    idx: usize,
+    len: usize,
+) -> Result<(), WithContext<ParseError>> {
+    if r1.cluster != r2.cluster {
+        Err(WithContext {
+            ctx: (idx, len).into(),
+            help: Some(help::CLUSTER_MISMATCH.into()),
+            source: ParseError::RegisterClusterMismatch(r1.cluster, r2.cluster),
+        })
+    } else {
+        Ok(())
     }
 }
 
@@ -689,7 +715,7 @@ mod test {
     use super::{
         arithmetic::{BasicArgs, BasicOpcode, CarryArgs, CarryOpcode, SubArgs},
         memory::{LoadArgs, LoadOpcode, StoreArgs, StoreOpcode},
-        Action, Location, Operand, Operation, Register, RegisterType,
+        Action, Location, Operand, Operation, Register, RegisterClass,
     };
     pub fn positive<T, E>(tests: &[(&'static str, T)])
     where
@@ -733,28 +759,31 @@ mod test {
             (
                 "$r0.1",
                 Register {
+                    cluster: 0,
                     num: 1,
-                    class: RegisterType::General,
+                    class: RegisterClass::General,
                 },
             ),
             (
                 "$r0.56",
                 Register {
+                    cluster: 0,
                     num: 56,
-                    class: RegisterType::General,
+                    class: RegisterClass::General,
                 },
             ),
             (
-                "$b0.1",
+                "$b1.1",
                 Register {
+                    cluster: 1,
                     num: 1,
-                    class: RegisterType::Branch,
+                    class: RegisterClass::Branch,
                 },
             ),
         ]);
 
         negative::<Register, _>(&[
-            "r0.1", "$r1.1", "$d0.1", "b", "$0.1", "$.1", "$", "0", "$r0",
+            "r0.1", "$d0.1", "b", "$0.1", "$.1", "$", "0", "$r0", "",
         ]);
     }
 
@@ -764,21 +793,24 @@ mod test {
             (
                 "$r0.1",
                 Register {
-                    class: RegisterType::General,
+                    cluster: 0,
+                    class: RegisterClass::General,
                     num: 1,
                 },
             ),
             (
                 "$b0.8",
                 Register {
-                    class: RegisterType::Branch,
+                    cluster: 0,
+                    class: RegisterClass::Branch,
                     num: 8,
                 },
             ),
             (
                 "$l0.0",
                 Register {
-                    class: RegisterType::Link,
+                    cluster: 0,
+                    class: RegisterClass::Link,
                     num: 0,
                 },
             ),
@@ -791,7 +823,8 @@ mod test {
             (
                 "$r0.1",
                 Location::Register(Register {
-                    class: RegisterType::General,
+                    cluster: 0,
+                    class: RegisterClass::General,
                     num: 1,
                 }),
             ),
@@ -804,7 +837,8 @@ mod test {
             (
                 "$r0.1",
                 Operand::Register(Register {
-                    class: RegisterType::General,
+                    cluster: 0,
+                    class: RegisterClass::General,
                     num: 1,
                 }),
             ),
@@ -822,16 +856,19 @@ mod test {
                         BasicOpcode::MaxUnsigned,
                         BasicArgs {
                             src1: Register {
+                                cluster: 0,
                                 num: 1,
-                                class: RegisterType::General,
+                                class: RegisterClass::General,
                             },
                             src2: Operand::Register(Register {
+                                cluster: 0,
                                 num: 2,
-                                class: RegisterType::General,
+                                class: RegisterClass::General,
                             }),
                             dst: Register {
+                                cluster: 0,
                                 num: 3,
-                                class: RegisterType::General,
+                                class: RegisterClass::General,
                             },
                         },
                     ),
@@ -846,13 +883,15 @@ mod test {
                         LoadOpcode::Word,
                         LoadArgs {
                             base: Register {
+                                cluster: 0,
                                 num: 1,
-                                class: RegisterType::General,
+                                class: RegisterClass::General,
                             },
                             offset: 0x20,
                             dst: Register {
+                                cluster: 0,
                                 num: 3,
-                                class: RegisterType::General,
+                                class: RegisterClass::General,
                             },
                         },
                     ),
@@ -867,13 +906,15 @@ mod test {
                         StoreOpcode::Word,
                         StoreArgs {
                             base: Register {
+                                cluster: 0,
                                 num: 1,
-                                class: RegisterType::General,
+                                class: RegisterClass::General,
                             },
                             offset: 5,
                             src: Register {
+                                cluster: 0,
                                 num: 3,
-                                class: RegisterType::General,
+                                class: RegisterClass::General,
                             },
                         },
                     ),
@@ -886,13 +927,15 @@ mod test {
                 Operation {
                     action: Action::Sub(SubArgs {
                         dst: Register {
+                            cluster: 0,
                             num: 1,
-                            class: RegisterType::General,
+                            class: RegisterClass::General,
                         },
                         src1: Operand::Immediate(5),
                         src2: Register {
+                            cluster: 0,
                             num: 3,
-                            class: RegisterType::General,
+                            class: RegisterClass::General,
                         },
                     }),
                     cluster: 0,
@@ -906,24 +949,29 @@ mod test {
                         CarryOpcode::AddCarry,
                         CarryArgs {
                             cout: Register {
+                                cluster: 0,
                                 num: 1,
-                                class: RegisterType::Branch,
+                                class: RegisterClass::Branch,
                             },
                             dst: Register {
+                                cluster: 0,
                                 num: 1,
-                                class: RegisterType::General,
+                                class: RegisterClass::General,
                             },
                             cin: Register {
+                                cluster: 0,
                                 num: 2,
-                                class: RegisterType::Branch,
+                                class: RegisterClass::Branch,
                             },
                             src1: Register {
+                                cluster: 0,
                                 num: 2,
-                                class: RegisterType::General,
+                                class: RegisterClass::General,
                             },
                             src2: Register {
+                                cluster: 0,
                                 num: 3,
-                                class: RegisterType::General,
+                                class: RegisterClass::General,
                             },
                         },
                     ),
@@ -944,16 +992,19 @@ mod test {
                         BasicOpcode::MaxUnsigned,
                         BasicArgs {
                             src1: Register {
+                                cluster: 0,
                                 num: 1,
-                                class: RegisterType::General,
+                                class: RegisterClass::General,
                             },
                             src2: Operand::Register(Register {
+                                cluster: 0,
                                 num: 2,
-                                class: RegisterType::General,
+                                class: RegisterClass::General,
                             }),
                             dst: Register {
+                                cluster: 0,
                                 num: 3,
-                                class: RegisterType::General,
+                                class: RegisterClass::General,
                             },
                         },
                     ),
@@ -968,24 +1019,29 @@ mod test {
                         CarryOpcode::AddCarry,
                         CarryArgs {
                             cout: Register {
+                                cluster: 0,
                                 num: 1,
-                                class: RegisterType::Branch,
+                                class: RegisterClass::Branch,
                             },
                             dst: Register {
+                                cluster: 0,
                                 num: 1,
-                                class: RegisterType::General,
+                                class: RegisterClass::General,
                             },
                             cin: Register {
+                                cluster: 0,
                                 num: 2,
-                                class: RegisterType::Branch,
+                                class: RegisterClass::Branch,
                             },
                             src1: Register {
+                                cluster: 0,
                                 num: 2,
-                                class: RegisterType::General,
+                                class: RegisterClass::General,
                             },
                             src2: Register {
+                                cluster: 0,
                                 num: 3,
-                                class: RegisterType::General,
+                                class: RegisterClass::General,
                             },
                         },
                     ),

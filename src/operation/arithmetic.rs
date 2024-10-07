@@ -3,8 +3,8 @@ use std::{fmt::Display, str::FromStr};
 use crate::{Location, Machine, Outcome};
 
 use super::{
-    reg_err, trim_start, DecodeError, Info, Kind, Operand, OperandParseError, ParseError, Register,
-    RegisterType, WithContext,
+    check_cluster, reg_err, trim_start, DecodeError, Info, Kind, Operand, OperandParseError,
+    ParseError, Register, RegisterClass, WithContext,
 };
 
 /// Basic Opcodes for Arithmetic
@@ -254,10 +254,10 @@ impl FromStr for BasicArgs {
         };
         let val_len = dst.len();
         let dst: Register = dst.parse().map_err(|r| reg_err(r, idx))?;
-        if dst.class != RegisterType::General {
+        if dst.class != RegisterClass::General {
             return Err(WithContext {
-                source: ParseError::WrongRegisterType {
-                    wanted: RegisterType::General,
+                source: ParseError::WrongRegisterClass {
+                    wanted: RegisterClass::General,
                     got: dst.class,
                 },
                 ctx: (idx, 0).into(),
@@ -276,16 +276,17 @@ impl FromStr for BasicArgs {
         };
         let val_len = src1.len();
         let src1: Register = src1.parse().map_err(|r| reg_err(r, idx))?;
-        if src1.class != RegisterType::General {
+        if src1.class != RegisterClass::General {
             return Err(WithContext {
-                source: ParseError::WrongRegisterType {
-                    wanted: RegisterType::General,
+                source: ParseError::WrongRegisterClass {
+                    wanted: RegisterClass::General,
                     got: src1.class,
                 },
                 ctx: (idx, 0).into(),
                 help: None,
             });
         }
+        check_cluster(dst, src1, idx, val_len)?;
         idx += val_len + 1;
         let s = trim_start(s, &mut idx);
         // We're past the , this could either be a register or an immediate
@@ -304,16 +305,17 @@ impl FromStr for BasicArgs {
             help: None,
         })?;
         if let Operand::Register(r) = src2 {
-            if r.class != RegisterType::General {
+            if r.class != RegisterClass::General {
                 return Err(WithContext {
-                    source: ParseError::WrongRegisterType {
-                        wanted: RegisterType::General,
+                    source: ParseError::WrongRegisterClass {
+                        wanted: RegisterClass::General,
                         got: r.class,
                     },
                     ctx: (idx, 0).into(),
                     help: None,
                 });
             }
+            check_cluster(dst, r, idx, val_len)?;
         }
         idx += val_len + 1;
         let s = trim_start(splitter.next().unwrap_or_default(), &mut idx);
@@ -417,10 +419,10 @@ impl FromStr for CarryArgs {
         };
         let val_len = dst.len();
         let dst: Register = dst.parse().map_err(|r| reg_err(r, idx))?;
-        if dst.class != RegisterType::General {
+        if dst.class != RegisterClass::General {
             return Err(WithContext {
-                source: ParseError::WrongRegisterType {
-                    wanted: RegisterType::General,
+                source: ParseError::WrongRegisterClass {
+                    wanted: RegisterClass::General,
                     got: dst.class,
                 },
                 ctx: (idx, 0).into(),
@@ -439,16 +441,17 @@ impl FromStr for CarryArgs {
         };
         let val_len = cout.len();
         let cout: Register = cout.parse().map_err(|r| reg_err(r, idx))?;
-        if cout.class != RegisterType::Branch {
+        if cout.class != RegisterClass::Branch {
             return Err(WithContext {
-                source: ParseError::WrongRegisterType {
-                    wanted: RegisterType::Branch,
+                source: ParseError::WrongRegisterClass {
+                    wanted: RegisterClass::Branch,
                     got: cout.class,
                 },
                 ctx: (idx, 0).into(),
                 help: None,
             });
         }
+        check_cluster(dst, cout, idx, val_len)?;
         idx += val_len + 1;
         let s = trim_start(s, &mut idx);
         // We're past the =, get the input registers
@@ -461,16 +464,17 @@ impl FromStr for CarryArgs {
         };
         let val_len = cin.len();
         let cin: Register = cin.parse().map_err(|r| reg_err(r, idx))?;
-        if cin.class != RegisterType::Branch {
+        if cin.class != RegisterClass::Branch {
             return Err(WithContext {
-                source: ParseError::WrongRegisterType {
-                    wanted: RegisterType::Branch,
+                source: ParseError::WrongRegisterClass {
+                    wanted: RegisterClass::Branch,
                     got: cin.class,
                 },
                 ctx: (idx, 0).into(),
                 help: None,
             });
         }
+        check_cluster(dst, cin, idx, val_len)?;
         idx += val_len + 1;
         let s = trim_start(s, &mut idx);
         // Register s1
@@ -483,16 +487,17 @@ impl FromStr for CarryArgs {
         };
         let val_len = src1.len();
         let src1: Register = src1.parse().map_err(|r| reg_err(r, idx))?;
-        if src1.class != RegisterType::General {
+        if src1.class != RegisterClass::General {
             return Err(WithContext {
-                source: ParseError::WrongRegisterType {
-                    wanted: RegisterType::General,
+                source: ParseError::WrongRegisterClass {
+                    wanted: RegisterClass::General,
                     got: src1.class,
                 },
                 ctx: (idx, 0).into(),
                 help: None,
             });
         }
+        check_cluster(dst, src1, idx, val_len)?;
         idx += val_len + 1;
         let s = trim_start(s, &mut idx);
         // Register s2
@@ -506,16 +511,17 @@ impl FromStr for CarryArgs {
         };
         let val_len = src2.len();
         let src2: Register = src2.parse().map_err(|r| reg_err(r, idx))?;
-        if src2.class != RegisterType::General {
+        if src2.class != RegisterClass::General {
             return Err(WithContext {
-                source: ParseError::WrongRegisterType {
-                    wanted: RegisterType::General,
+                source: ParseError::WrongRegisterClass {
+                    wanted: RegisterClass::General,
                     got: src2.class,
                 },
                 ctx: (idx, 0).into(),
                 help: None,
             });
         }
+        check_cluster(dst, src2, idx, val_len)?;
         idx += val_len + 1;
         let s = trim_start(splitter.next().unwrap_or_default(), &mut idx);
         if !s.is_empty() {
@@ -643,10 +649,10 @@ impl FromStr for SubArgs {
         };
         let val_len = dst.len();
         let dst: Register = dst.parse().map_err(|r| reg_err(r, idx))?;
-        if dst.class != RegisterType::General {
+        if dst.class != RegisterClass::General {
             return Err(WithContext {
-                source: ParseError::WrongRegisterType {
-                    wanted: RegisterType::General,
+                source: ParseError::WrongRegisterClass {
+                    wanted: RegisterClass::General,
                     got: dst.class,
                 },
                 ctx: (idx, 0).into(),
@@ -670,16 +676,17 @@ impl FromStr for SubArgs {
             help: None,
         })?;
         if let Operand::Register(r) = src1 {
-            if r.class != RegisterType::General {
+            if r.class != RegisterClass::General {
                 return Err(WithContext {
-                    source: ParseError::WrongRegisterType {
-                        wanted: RegisterType::General,
+                    source: ParseError::WrongRegisterClass {
+                        wanted: RegisterClass::General,
                         got: r.class,
                     },
                     ctx: (idx, 0).into(),
                     help: None,
                 });
             }
+            check_cluster(dst, r, idx, val_len)?;
         }
         idx += val_len + 1;
         // We're past the first operand. At this point it better be a register
@@ -693,16 +700,17 @@ impl FromStr for SubArgs {
         };
         let val_len = src2.len();
         let src2: Register = src2.parse().map_err(|r| reg_err(r, idx))?;
-        if src2.class != RegisterType::General {
+        if src2.class != RegisterClass::General {
             return Err(WithContext {
-                source: ParseError::WrongRegisterType {
-                    wanted: RegisterType::General,
+                source: ParseError::WrongRegisterClass {
+                    wanted: RegisterClass::General,
                     got: src2.class,
                 },
                 ctx: (idx, 0).into(),
                 help: None,
             });
         }
+        check_cluster(dst, src2, idx, val_len)?;
         idx += val_len + 1;
         let s = trim_start(splitter.next().unwrap_or_default(), &mut idx);
         if !s.is_empty() {
@@ -808,10 +816,10 @@ impl FromStr for ExtendArgs {
         };
         let val_len = dst.len();
         let dst: Register = dst.parse().map_err(|r| reg_err(r, idx))?;
-        if dst.class != RegisterType::General {
+        if dst.class != RegisterClass::General {
             return Err(WithContext {
-                source: ParseError::WrongRegisterType {
-                    wanted: RegisterType::General,
+                source: ParseError::WrongRegisterClass {
+                    wanted: RegisterClass::General,
                     got: dst.class,
                 },
                 ctx: (idx, 0).into(),
@@ -831,16 +839,17 @@ impl FromStr for ExtendArgs {
         };
         let val_len = src.len();
         let src: Register = src.parse().map_err(|r| reg_err(r, idx))?;
-        if src.class != RegisterType::General {
+        if src.class != RegisterClass::General {
             return Err(WithContext {
-                source: ParseError::WrongRegisterType {
-                    wanted: RegisterType::General,
+                source: ParseError::WrongRegisterClass {
+                    wanted: RegisterClass::General,
                     got: src.class,
                 },
                 ctx: (idx, 0).into(),
                 help: None,
             });
         }
+        check_cluster(dst, src, idx, val_len)?;
         idx += val_len + 1;
         let s = trim_start(splitter.next().unwrap_or_default(), &mut idx);
         if !s.is_empty() {
@@ -893,7 +902,7 @@ mod test {
     };
     use crate::{
         machine::test::test_machine,
-        operation::{arithmetic::SubArgs, Info, Location, Operand, Register, RegisterType},
+        operation::{arithmetic::SubArgs, Info, Location, Operand, Register, RegisterClass},
         Outcome,
     };
     #[test]
@@ -903,16 +912,19 @@ mod test {
                 "$r0.2 = $r0.3, $r0.4",
                 BasicArgs {
                     dst: Register {
+                        cluster: 0,
                         num: 2,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                     src1: Register {
+                        cluster: 0,
                         num: 3,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                     src2: Operand::Register(Register {
+                        cluster: 0,
                         num: 4,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     }),
                 },
             ),
@@ -920,12 +932,14 @@ mod test {
                 "$r0.2 = $r0.3,5",
                 BasicArgs {
                     dst: Register {
+                        cluster: 0,
                         num: 2,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                     src1: Register {
+                        cluster: 0,
                         num: 3,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                     src2: Operand::Immediate(5),
                 },
@@ -934,12 +948,14 @@ mod test {
                 "$r0.2 =$r0.3, 0x20 ",
                 BasicArgs {
                     dst: Register {
+                        cluster: 0,
                         num: 2,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                     src1: Register {
+                        cluster: 0,
                         num: 3,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                     src2: Operand::Immediate(0x20),
                 },
@@ -967,15 +983,18 @@ mod test {
                 "$r0.1 = $r0.4, $r0.2",
                 BasicArgs {
                     src1: Register {
-                        class: RegisterType::General,
+                        cluster: 0,
+                        class: RegisterClass::General,
                         num: 4,
                     },
                     src2: Operand::Register(Register {
-                        class: RegisterType::General,
+                        cluster: 0,
+                        class: RegisterClass::General,
                         num: 2,
                     }),
                     dst: Register {
-                        class: RegisterType::General,
+                        cluster: 0,
+                        class: RegisterClass::General,
                         num: 1,
                     },
                 },
@@ -984,12 +1003,14 @@ mod test {
                 "$r0.1 = $r0.4, 0x20",
                 BasicArgs {
                     src1: Register {
-                        class: RegisterType::General,
+                        cluster: 0,
+                        class: RegisterClass::General,
                         num: 4,
                     },
                     src2: Operand::Immediate(0x20),
                     dst: Register {
-                        class: RegisterType::General,
+                        cluster: 0,
+                        class: RegisterClass::General,
                         num: 1,
                     },
                 },
@@ -1002,12 +1023,14 @@ mod test {
         let mut machine = test_machine();
         let args = BasicArgs {
             src1: Register {
-                class: RegisterType::General,
+                cluster: 0,
+                class: RegisterClass::General,
                 num: 4,
             },
             src2: Operand::Immediate(0x20),
             dst: Register {
-                class: RegisterType::General,
+                cluster: 0,
+                class: RegisterClass::General,
                 num: 1,
             },
         };
@@ -1030,16 +1053,19 @@ mod test {
                 "$r0.2 = $r0.0, $r0.1",
                 SubArgs {
                     dst: Register {
-                        class: RegisterType::General,
+                        cluster: 0,
+                        class: RegisterClass::General,
                         num: 2,
                     },
                     src1: Operand::Register(Register {
+                        cluster: 0,
                         num: 0,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     }),
                     src2: Register {
+                        cluster: 0,
                         num: 1,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                 },
             ),
@@ -1047,13 +1073,15 @@ mod test {
                 "$r0.2 = 5  , $r0.1",
                 SubArgs {
                     dst: Register {
-                        class: RegisterType::General,
+                        cluster: 0,
+                        class: RegisterClass::General,
                         num: 2,
                     },
                     src1: Operand::Immediate(5),
                     src2: Register {
+                        cluster: 0,
                         num: 1,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                 },
             ),
@@ -1079,15 +1107,18 @@ mod test {
                 "$r0.1 = $r0.4, $r0.2",
                 SubArgs {
                     src2: Register {
-                        class: RegisterType::General,
+                        cluster: 0,
+                        class: RegisterClass::General,
                         num: 2,
                     },
                     src1: Operand::Register(Register {
-                        class: RegisterType::General,
+                        cluster: 0,
+                        class: RegisterClass::General,
                         num: 4,
                     }),
                     dst: Register {
-                        class: RegisterType::General,
+                        cluster: 0,
+                        class: RegisterClass::General,
                         num: 1,
                     },
                 },
@@ -1096,12 +1127,14 @@ mod test {
                 "$r0.1 = 0x20, $r0.4",
                 SubArgs {
                     src2: Register {
-                        class: RegisterType::General,
+                        cluster: 0,
+                        class: RegisterClass::General,
                         num: 4,
                     },
                     src1: Operand::Immediate(0x20),
                     dst: Register {
-                        class: RegisterType::General,
+                        cluster: 0,
+                        class: RegisterClass::General,
                         num: 1,
                     },
                 },
@@ -1114,12 +1147,14 @@ mod test {
         let mut machine = test_machine();
         let args = SubArgs {
             src2: Register {
-                class: RegisterType::General,
+                cluster: 0,
+                class: RegisterClass::General,
                 num: 4,
             },
             src1: Operand::Immediate(0x20),
             dst: Register {
-                class: RegisterType::General,
+                cluster: 0,
+                class: RegisterClass::General,
                 num: 1,
             },
         };
@@ -1144,24 +1179,29 @@ mod test {
                 "   $r0.1, $b0.1 = $b0.2, $r0.2,    $r0.3         ",
                 CarryArgs {
                     cout: Register {
+                        cluster: 0,
                         num: 1,
-                        class: RegisterType::Branch,
+                        class: RegisterClass::Branch,
                     },
                     dst: Register {
+                        cluster: 0,
                         num: 1,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                     cin: Register {
+                        cluster: 0,
                         num: 2,
-                        class: RegisterType::Branch,
+                        class: RegisterClass::Branch,
                     },
                     src1: Register {
+                        cluster: 0,
                         num: 2,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                     src2: Register {
+                        cluster: 0,
                         num: 3,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                 },
             ),
@@ -1169,24 +1209,29 @@ mod test {
                 "$r0.1,$b0.1=$b0.2,$r0.2,$r0.3",
                 CarryArgs {
                     cout: Register {
+                        cluster: 0,
                         num: 1,
-                        class: RegisterType::Branch,
+                        class: RegisterClass::Branch,
                     },
                     dst: Register {
+                        cluster: 0,
                         num: 1,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                     cin: Register {
+                        cluster: 0,
                         num: 2,
-                        class: RegisterType::Branch,
+                        class: RegisterClass::Branch,
                     },
                     src1: Register {
+                        cluster: 0,
                         num: 2,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                     src2: Register {
+                        cluster: 0,
                         num: 3,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                 },
             ),
@@ -1214,24 +1259,29 @@ mod test {
                 "$r0.1, $b0.1 = $b0.2, $r0.2, $r0.3",
                 CarryArgs {
                     cout: Register {
+                        cluster: 0,
                         num: 1,
-                        class: RegisterType::Branch,
+                        class: RegisterClass::Branch,
                     },
                     dst: Register {
+                        cluster: 0,
                         num: 1,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                     cin: Register {
+                        cluster: 0,
                         num: 2,
-                        class: RegisterType::Branch,
+                        class: RegisterClass::Branch,
                     },
                     src1: Register {
+                        cluster: 0,
                         num: 2,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                     src2: Register {
+                        cluster: 0,
                         num: 3,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                 },
             ),
@@ -1239,24 +1289,29 @@ mod test {
                 "$r0.1, $b0.18 = $b0.2, $r0.2, $r0.3",
                 CarryArgs {
                     cout: Register {
+                        cluster: 0,
                         num: 18,
-                        class: RegisterType::Branch,
+                        class: RegisterClass::Branch,
                     },
                     dst: Register {
+                        cluster: 0,
                         num: 1,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                     cin: Register {
+                        cluster: 0,
                         num: 2,
-                        class: RegisterType::Branch,
+                        class: RegisterClass::Branch,
                     },
                     src1: Register {
+                        cluster: 0,
                         num: 2,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                     src2: Register {
+                        cluster: 0,
                         num: 3,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                 },
             ),
@@ -1270,12 +1325,14 @@ mod test {
                 "$r0.2 = $r0.3   ",
                 ExtendArgs {
                     dst: Register {
+                        cluster: 0,
                         num: 2,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                     src: Register {
+                        cluster: 0,
                         num: 3,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                 },
             ),
@@ -1283,12 +1340,14 @@ mod test {
                 "$r0.2=$r0.3",
                 ExtendArgs {
                     dst: Register {
+                        cluster: 0,
                         num: 2,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                     src: Register {
+                        cluster: 0,
                         num: 3,
-                        class: RegisterType::General,
+                        class: RegisterClass::General,
                     },
                 },
             ),

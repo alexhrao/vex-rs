@@ -5,13 +5,14 @@ use machine::{Machine, MemoryValue, Violation, OUTPUT_REG};
 use miette::{Diagnostic, IntoDiagnostic, NamedSource, SourceSpan};
 use operation::WithContext;
 use std::fs;
+use std::num::NonZeroUsize;
 use std::{borrow::Cow, fmt::Display};
 use thiserror::Error;
 
 mod machine;
 mod operation;
 
-use operation::{Instruction, Kind, Location, Operation, ParseError};
+use operation::{Instruction, Location, Operation, ParseError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumIter)]
 enum Resource {
@@ -88,46 +89,49 @@ impl Display for Outcome {
 #[command(version)]
 struct Args {
     /// Number of slots
-    #[arg(long, short, default_value_t = 4)]
-    num_slots: usize,
+    #[arg(long, short, default_value_t = NonZeroUsize::new(4).unwrap())]
+    num_slots: NonZeroUsize,
+    /// Number of clusteres
+    #[arg(long, short, default_value_t = NonZeroUsize::new(1).unwrap())]
+    num_clusters: NonZeroUsize,
     /// Number of integer resources
-    #[arg(long, default_value_t = 4)]
-    alu_slots: usize,
+    #[arg(long, default_value_t = NonZeroUsize::new(4).unwrap())]
+    alu_slots: NonZeroUsize,
     /// Latency for ALU operations
-    #[arg(long, default_value_t = 1)]
-    alu_latency: usize,
+    #[arg(long, default_value_t = NonZeroUsize::new(1).unwrap())]
+    alu_latency: NonZeroUsize,
     /// Number of multipliers
-    #[arg(long, default_value_t = 2)]
-    mul_slots: usize,
+    #[arg(long, default_value_t = NonZeroUsize::new(2).unwrap())]
+    mul_slots: NonZeroUsize,
     /// Latency for MUL operations
-    #[arg(long, default_value_t = 2)]
-    mul_latency: usize,
+    #[arg(long, default_value_t = NonZeroUsize::new(2).unwrap())]
+    mul_latency: NonZeroUsize,
     /// Number of memory load resources
-    #[arg(long, default_value_t = 1)]
-    load_slots: usize,
+    #[arg(long, default_value_t = NonZeroUsize::new(1).unwrap())]
+    load_slots: NonZeroUsize,
     /// Number of memory store resources
-    #[arg(long, default_value_t = 1)]
-    store_slots: usize,
+    #[arg(long, default_value_t = NonZeroUsize::new(1).unwrap())]
+    store_slots: NonZeroUsize,
     /// Latency for LOAD operations
-    #[arg(long, default_value_t = 3)]
-    load_latency: usize,
+    #[arg(long, default_value_t = NonZeroUsize::new(3).unwrap())]
+    load_latency: NonZeroUsize,
     /// Latency for STORE operations
-    #[arg(long, default_value_t = 3)]
-    store_latency: usize,
+    #[arg(long, default_value_t = NonZeroUsize::new(3).unwrap())]
+    store_latency: NonZeroUsize,
     /// Assert to print debugging information; useful if your code is failing
     /// to compile or producing... interesting results
     #[arg(long, short, default_value_t = false)]
     verbose: bool,
     /// Size of memory, in bytes
-    #[arg(long, default_value_t = 4096)]
-    mem_size: usize,
+    #[arg(long, default_value_t = NonZeroUsize::new(4096).unwrap())]
+    mem_size: NonZeroUsize,
     /// Number of general-purpose registers. This is in addition to
     /// the zero register, $r0.0
-    #[arg(long, default_value_t = 64)]
-    num_regs: usize,
+    #[arg(long, default_value_t = NonZeroUsize::new(64).unwrap())]
+    num_regs: NonZeroUsize,
     /// Number of branch registers
-    #[arg(long, default_value_t = 8)]
-    num_bregs: usize,
+    #[arg(long, default_value_t = NonZeroUsize::new(8).unwrap())]
+    num_bregs: NonZeroUsize,
     /// Basic Block file
     file: String,
     /// Numbers (inputs for your VEX code)
@@ -140,16 +144,6 @@ enum ParameterError {
     NotEnoughMemory(usize),
     #[error("Memory must be aligned to 4 bytes; given {0}")]
     BadMemoryAlign(usize),
-    #[error("At least two general registers are required")]
-    NotEnoughRegisters,
-    #[error("At least one branch register is required")]
-    NotEnoughBranchRegisters,
-    #[error("At least one slot is required")]
-    NotEnoughSlots,
-    #[error("At least one {0} is required")]
-    NotEnoughUnit(Resource),
-    #[error("Latency for {0} must be non-zero")]
-    ZeroLatency(Kind),
     #[error("Exactly 10 numbers must be provided; {0} given")]
     InvalidArguments(usize),
     #[error("Input file `{0}` not found")]
