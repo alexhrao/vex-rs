@@ -10,7 +10,7 @@ use std::{
 use strum::IntoEnumIterator;
 
 use crate::{
-    operation::{Alignment, DecodeError, Kind, Location, Operation, Register, RegisterType},
+    operation::{Alignment, DecodeError, Location, Operation, Register, RegisterType},
     Args, Outcome, ParameterError, Resource,
 };
 
@@ -249,36 +249,36 @@ impl<'a> IndexMut<Register> for Machine<'a> {
 }
 
 impl<'a> Machine<'a> {
-    pub fn latency(&self, kind: Kind) -> usize {
-        match kind.into() {
-            Resource::Alu => self.alu_latency,
-            Resource::Mul => self.mul_latency,
+    pub fn latency(&self, resource: Resource) -> usize {
+        match resource {
+            Resource::Arithmetic => self.alu_latency,
+            Resource::Multiplication => self.mul_latency,
             Resource::Load => self.load_latency,
             Resource::Store => self.store_latency,
         }
     }
     pub const fn capacity(&self, resource: Resource) -> usize {
         match resource {
-            Resource::Alu => self.num_alus,
+            Resource::Arithmetic => self.num_alus,
             Resource::Load => self.num_loads,
             Resource::Store => self.num_stores,
-            Resource::Mul => self.num_muls,
+            Resource::Multiplication => self.num_muls,
         }
     }
     pub const fn resource(&self, resource: Resource) -> &Vec<Issued<'a>> {
         match resource {
-            Resource::Alu => &self.alus,
+            Resource::Arithmetic => &self.alus,
             Resource::Load => &self.loads,
             Resource::Store => &self.stores,
-            Resource::Mul => &self.muls,
+            Resource::Multiplication => &self.muls,
         }
     }
     fn resource_mut(&mut self, resource: Resource) -> &mut Vec<Issued<'a>> {
         match resource {
-            Resource::Alu => &mut self.alus,
+            Resource::Arithmetic => &mut self.alus,
             Resource::Load => &mut self.loads,
             Resource::Store => &mut self.stores,
-            Resource::Mul => &mut self.muls,
+            Resource::Multiplication => &mut self.muls,
         }
     }
     pub fn get_reg(&self, r: Register) -> Result<u32, DecodeError> {
@@ -427,7 +427,7 @@ impl<'a> Machine<'a> {
             }
             let k = op.action.kind();
             let r = k.into();
-            let latency = self.latency(k);
+            let latency = self.latency(r);
             let cap = self.capacity(r);
             let units = self.resource_mut(r);
             if units.len() == cap {
@@ -565,10 +565,10 @@ impl<'a> TryFrom<&Args> for Machine<'a> {
             return Err(ParameterError::NotEnoughSlots);
         }
         if args.mul_slots == 0 {
-            return Err(ParameterError::NotEnoughUnit(Resource::Mul));
+            return Err(ParameterError::NotEnoughUnit(Resource::Multiplication));
         }
         if args.alu_slots == 0 {
-            return Err(ParameterError::NotEnoughUnit(Resource::Alu));
+            return Err(ParameterError::NotEnoughUnit(Resource::Arithmetic));
         }
         if args.load_slots == 0 {
             return Err(ParameterError::NotEnoughUnit(Resource::Load));
@@ -577,16 +577,16 @@ impl<'a> TryFrom<&Args> for Machine<'a> {
             return Err(ParameterError::NotEnoughUnit(Resource::Store));
         }
         if args.load_latency == 0 {
-            return Err(ParameterError::ZeroLatency(Kind::Load));
+            return Err(ParameterError::ZeroLatency(Resource::Load));
         }
         if args.alu_latency == 0 {
-            return Err(ParameterError::ZeroLatency(Kind::Arithmetic));
+            return Err(ParameterError::ZeroLatency(Resource::Arithmetic));
         }
         if args.store_latency == 0 {
-            return Err(ParameterError::ZeroLatency(Kind::Store));
+            return Err(ParameterError::ZeroLatency(Resource::Store));
         }
         if args.mul_latency == 0 {
-            return Err(ParameterError::ZeroLatency(Kind::Multiplication));
+            return Err(ParameterError::ZeroLatency(Resource::Multiplication));
         }
         if args.nums.len() != 10 {
             return Err(ParameterError::InvalidArguments(args.nums.len()));

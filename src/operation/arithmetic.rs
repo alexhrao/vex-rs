@@ -1,9 +1,9 @@
 use std::{fmt::Display, str::FromStr};
 
-use crate::{Location, Machine, Outcome};
+use crate::{Location, Machine, Outcome, Resource};
 
 use super::{
-    reg_err, trim_start, DecodeError, Info, Kind, Operand, OperandParseError, ParseError, Register,
+    reg_err, trim_start, DecodeError, Info, Operand, OperandParseError, ParseError, Register,
     RegisterType, WithContext,
 };
 
@@ -163,7 +163,7 @@ impl BasicOpcode {
         }
     }
     /// Get the kind of this opcode
-    pub const fn kind(self) -> Kind {
+    pub const fn kind(self) -> Resource {
         match self {
             Self::MultiplyHighSigned
             | Self::MultiplyHighHighSigned
@@ -175,8 +175,8 @@ impl BasicOpcode {
             | Self::MultiplyLowHighUnsigned
             | Self::MultiplyLowLowSigned
             | Self::MultiplyLowLowUnsigned
-            | Self::MultiplyLowUnsigned => Kind::Multiplication,
-            _ => Kind::Arithmetic,
+            | Self::MultiplyLowUnsigned => Resource::Multiplication,
+            _ => Resource::Arithmetic,
         }
     }
 }
@@ -371,8 +371,8 @@ impl CarryOpcode {
             Self::Divide => "divs",
         }
     }
-    pub const fn kind(&self) -> Kind {
-        Kind::Arithmetic
+    pub const fn kind(&self) -> Resource {
+        Resource::Arithmetic
     }
 }
 

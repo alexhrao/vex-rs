@@ -11,12 +11,12 @@ use thiserror::Error;
 mod machine;
 mod operation;
 
-use operation::{Instruction, Kind, Location, Operation, ParseError};
+use operation::{Instruction, Location, Operation, ParseError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumIter)]
 enum Resource {
-    Alu,
-    Mul,
+    Arithmetic,
+    Multiplication,
     Load,
     Store,
 }
@@ -24,10 +24,10 @@ enum Resource {
 impl Display for Resource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Alu => "Arithmetic & Logic",
+            Self::Arithmetic => "Arithmetic & Logic",
             Self::Load => "Memory Load",
             Self::Store => "Memory Store",
-            Self::Mul => "Multiplier",
+            Self::Multiplication => "Multiplier",
         })
     }
 }
@@ -149,7 +149,7 @@ enum ParameterError {
     #[error("At least one {0} is required")]
     NotEnoughUnit(Resource),
     #[error("Latency for {0} must be non-zero")]
-    ZeroLatency(Kind),
+    ZeroLatency(Resource),
     #[error("Exactly 10 numbers must be provided; {0} given")]
     InvalidArguments(usize),
     #[error("Input file `{0}` not found")]
