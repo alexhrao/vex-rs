@@ -33,26 +33,6 @@ impl Display for Resource {
     }
 }
 
-// #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-// struct Move {
-//     dst: usize,
-//     payload: String,
-// }
-
-// impl FromStr for Move {
-//     type Err = ();
-
-//     fn from_str(s: &str) -> Result<Self, Self::Err> {
-//         static MOV: LazyLock<Regex> =
-//             LazyLock::new(|| Regex::new(r"^\$r0\.(\d+)\s*=\s*([^#]+)").unwrap());
-//         let caps = MOV.captures(s).unwrap();
-//         let dst = caps.get(1).unwrap().as_str().parse().map_err(|_| ())?;
-//         let payload = caps.get(2).unwrap().as_str().trim().to_owned();
-
-//         Ok(Self { dst, payload })
-//     }
-// }
-
 /// Describes how a result should be committed
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct Outcome {
