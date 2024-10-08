@@ -89,38 +89,6 @@ impl<S> WithContext<S> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Kind {
-    Arithmetic,
-    Multiplication,
-    Load,
-    Store,
-    // Intercluster,
-}
-
-impl Display for Kind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Arithmetic => "Arithmetic",
-            Self::Multiplication => "Multiplication",
-            Self::Load => "Load",
-            Self::Store => "Store",
-            // Self::Intercluster => "Intercluster Communication",
-        })
-    }
-}
-
-impl From<Kind> for Resource {
-    fn from(value: Kind) -> Self {
-        match value {
-            Kind::Arithmetic /*| Kind::Intercluster */ => Self::Alu,
-            Kind::Load => Self::Load,
-            Kind::Store => Self::Store,
-            Kind::Multiplication => Self::Mul,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Operand {
     Register(Register),
     Immediate(u32),
@@ -574,15 +542,15 @@ impl Action {
             Self::Recv(_) => "recv",
         }
     }
-    pub const fn kind(&self) -> Kind {
+    pub const fn kind(&self) -> Resource {
         match self {
             Self::BasicArithmetic(op, _) => op.kind(),
             Self::CarryArithmetic(op, _) => op.kind(),
-            Self::Sub(_) | Self::Extend(_, _) => Kind::Arithmetic,
-            Self::Move(_) | Self::Send(_) | Self::Recv(_) => Kind::Arithmetic,
-            Self::Compare(_, _) | Self::Logical(_, _) | Self::Select(_, _) => Kind::Arithmetic,
-            Self::Load(_, _) => Kind::Load,
-            Self::Store(_, _) => Kind::Store,
+            Self::Sub(_) | Self::Extend(_, _) => Resource::Arithmetic,
+            Self::Move(_) | Self::Send(_) | Self::Recv(_) => Resource::Arithmetic,
+            Self::Compare(_, _) | Self::Logical(_, _) | Self::Select(_, _) => Resource::Arithmetic,
+            Self::Load(_, _) => Resource::Load,
+            Self::Store(_, _) => Resource::Store,
         }
     }
 }
