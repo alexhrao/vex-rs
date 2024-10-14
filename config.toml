@@ -1,0 +1,23 @@
+[machine]
+slots = 4
+mem = 4096
+
+[machine.alu]
+slots = 4
+latency = 1
+
+[machine.load]
+slots = 1
+latency = 3
+
+[machine.store]
+slots = 1
+latency = 3
+
+[machine.mul]
+slots = 2
+latency = 2
+
+[[machine.clusters]]
+regs = 64
+branch = 8

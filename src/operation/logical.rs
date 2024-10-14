@@ -1,11 +1,17 @@
+//! Logical operations
+//!
+//! These operations concern things like conditionals and basic
+//! logical commands (e.g., `AND`, etc.). Note that this does
+//! **not** include functionality for doing something based on
+//! these conditionals.
 use std::{fmt::Display, str::FromStr};
 
-use crate::{machine::Machine, Outcome};
-
 use super::{
-    check_cluster, reg_err, trim_start, DecodeError, Info, Location, Operand, OperandParseError, ParseError, Register, RegisterClass, WithContext
+    check_cluster, DecodeError, Info, Location, Machine, Operand, Outcome, ParseError, ParseState,
+    Register, RegisterClass, WithContext,
 };
 
+/// Codes for comparison operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CompareOpcode {
     /// Test for equality
@@ -31,6 +37,7 @@ pub enum CompareOpcode {
 }
 
 impl CompareOpcode {
+    /// Textual representation of this command
     pub const fn code(self) -> &'static str {
         match self {
             Self::Equal => "cmpeq",
@@ -45,9 +52,10 @@ impl CompareOpcode {
             Self::LesserOrEqualUnsigned => "cmpleu",
         }
     }
-
-    pub fn execute(&self, a: u32, b: u32) -> u32 {
-        (match self {
+    /// Execute the command with the two sources
+    pub fn execute(self, a: u32, b: u32) -> u32 {
+        #[allow(clippy::cast_possible_wrap)]
+        u32::from(match self {
             Self::Equal => a == b,
             Self::NotEqual => a != b,
             Self::GreaterSigned => (a as i32) > (b as i32),
@@ -58,7 +66,7 @@ impl CompareOpcode {
             Self::LesserUnsigned => a < b,
             Self::LesserOrEqualSigned => (a as i32) <= (b as i32),
             Self::LesserOrEqualUnsigned => a <= b,
-        }) as u32
+        })
     }
 }
 
@@ -87,78 +95,54 @@ impl Display for CompareOpcode {
     }
 }
 
+/// Arguments for comparison
+///
+/// Note that on the surface, this appears to be the same
+/// as the [basic `Args`](`super::arithmetic::Args`) used for arithmetic.
+/// However, those arguments require the destination to be a general-purpose
+/// register; for comparisons, that destination can be either general-purpose
+/// or branch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CompareArgs {
+    /// The first source register
     pub(super) src1: Register,
+    /// The second source, either a register or a literal
     pub(super) src2: Operand,
+    /// Where to put the value
     pub(super) dst: Register,
 }
 
 impl FromStr for CompareArgs {
     type Err = WithContext<ParseError>;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut idx = 0;
-        let s = trim_start(s, &mut idx);
+        let mut s = ParseState::new(s);
         // Chomp the destination register
-        let Some((dst, s)) = s.split_once('=') else {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        };
-        let val_len = dst.len();
-        let dst: Register = dst.parse().map_err(|r| reg_err(r, idx))?;
+        let (dst, ctx) = s.chomp_register('=')?;
         if dst.class != RegisterClass::General && dst.class != RegisterClass::Branch {
             return Err(WithContext {
                 source: ParseError::WrongRegisterClass {
                     wanted: RegisterClass::Branch,
                     got: dst.class,
                 },
-                ctx: (idx, 0).into(),
+                ctx,
                 help: None,
             });
         }
-        // We're past the =, trim and get the first register
-        idx += val_len + 1;
-        let s = trim_start(s, &mut idx);
-        let Some((src1, s)) = s.split_once(',') else {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        };
-        let val_len = src1.len();
-        let src1: Register = src1.parse().map_err(|r| reg_err(r, idx))?;
+        // We're past the =, get the first register
+        let (src1, ctx) = s.chomp_register(',')?;
         if src1.class != RegisterClass::General {
             return Err(WithContext {
                 source: ParseError::WrongRegisterClass {
                     wanted: RegisterClass::General,
                     got: src1.class,
                 },
-                ctx: (idx, 0).into(),
+                ctx,
                 help: None,
             });
         }
-        check_cluster(dst, src1, idx, val_len)?;
-        idx += val_len + 1;
-        let s = trim_start(s, &mut idx);
+        check_cluster(dst, src1, ctx)?;
         // We're past the , this could either be a register or an immediate
-        let mut splitter = s.split_whitespace();
-        let Some(src2) = splitter.next() else {
-            return Err(WithContext {
-                source: ParseError::NoValue,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        };
-        let val_len = src2.len();
-        let src2: Operand = src2.parse().map_err(|op: OperandParseError| WithContext {
-            source: ParseError::BadOperand(src2.to_owned(), op),
-            ctx: (idx, val_len).into(),
-            help: None,
-        })?;
+        let (src2, ctx) = s.chomp_operand(' ')?;
         if let Operand::Register(r) = src2 {
             if r.class != RegisterClass::General {
                 return Err(WithContext {
@@ -166,23 +150,14 @@ impl FromStr for CompareArgs {
                         wanted: RegisterClass::General,
                         got: r.class,
                     },
-                    ctx: (idx, 0).into(),
+                    ctx,
                     help: None,
                 });
             }
-            check_cluster(dst, r, idx, val_len)?;
+            check_cluster(dst, r, ctx)?;
         }
-        idx += val_len + 1;
-        let s = trim_start(splitter.next().unwrap_or_default(), &mut idx);
-        if !s.is_empty() {
-            Err(WithContext {
-                source: ParseError::ExpectedEnd(s.to_owned()),
-                ctx: (idx, s.len()).into(),
-                help: None,
-            })
-        } else {
-            Ok(Self { src1, src2, dst })
-        }
+        s.finish()?;
+        Ok(Self { src1, src2, dst })
     }
 }
 
@@ -219,8 +194,9 @@ impl Display for CompareArgs {
     }
 }
 
+/// Commands for simple logical operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum LogicalOpcode {
+pub enum Opcode {
     /// Perform a logical `NAND`
     NotAnd,
     /// Perform a logical `NOR`
@@ -231,7 +207,8 @@ pub enum LogicalOpcode {
     And,
 }
 
-impl LogicalOpcode {
+impl Opcode {
+    /// Textual representation of this command
     pub const fn code(self) -> &'static str {
         match self {
             Self::NotAnd => "nandl",
@@ -240,42 +217,18 @@ impl LogicalOpcode {
             Self::And => "andl",
         }
     }
-
-    pub fn execute(&self, a: u32, b: u32) -> u32 {
+    /// Execute the command's functionality
+    pub fn execute(self, a: u32, b: u32) -> u32 {
         match self {
-            Self::NotAnd => {
-                if a == 0 || b == 0 {
-                    1
-                } else {
-                    0
-                }
-            }
-            Self::NotOr => {
-                if a == 0 && b == 0 {
-                    1
-                } else {
-                    0
-                }
-            }
-            Self::Or => {
-                if a == 0 && b == 0 {
-                    0
-                } else {
-                    1
-                }
-            }
-            Self::And => {
-                if a != 0 && b != 0 {
-                    1
-                } else {
-                    0
-                }
-            }
+            Self::NotAnd => u32::from(a == 0 || b == 0),
+            Self::NotOr => u32::from(a == 0 && b == 0),
+            Self::Or => u32::from(!(a == 0 && b == 0)),
+            Self::And => u32::from(a != 0 && b != 0),
         }
     }
 }
 
-impl FromStr for LogicalOpcode {
+impl FromStr for Opcode {
     type Err = ();
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
@@ -288,118 +241,80 @@ impl FromStr for LogicalOpcode {
     }
 }
 
-impl Display for LogicalOpcode {
+impl Display for Opcode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.code())
     }
 }
 
+/// Arguments for logical operations. No immediates are allowed
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct LogicalArgs {
+pub struct Args {
+    /// The first source register
     pub(super) src1: Register,
+    /// The second source register
     pub(super) src2: Register,
+    /// The destination register
     pub(super) dst: Register,
 }
 
-impl FromStr for LogicalArgs {
+impl FromStr for Args {
     type Err = WithContext<ParseError>;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut idx = 0;
-        let s = trim_start(s, &mut idx);
+        let mut s = ParseState::new(s);
         // Chomp the destination register
-        let Some((dst, s)) = s.split_once('=') else {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        };
-        let val_len = dst.len();
-        let dst: Register = dst.parse().map_err(|r| reg_err(r, idx))?;
+        let (dst, ctx) = s.chomp_register('=')?;
         if dst.class != RegisterClass::General && dst.class != RegisterClass::Branch {
             return Err(WithContext {
                 source: ParseError::WrongRegisterClass {
                     wanted: RegisterClass::Branch,
                     got: dst.class,
                 },
-                ctx: (idx, 0).into(),
+                ctx,
                 help: None,
             });
         }
-        // We're past the =, trim and get the first register
-        idx += val_len + 1;
-        let s = trim_start(s, &mut idx);
-        let Some((src1, s)) = s.split_once(',') else {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        };
-        let val_len = src1.len();
-        let src1: Register = src1.parse().map_err(|r| reg_err(r, idx))?;
+        // We're past the =, get the first register
+
+        let (src1, ctx) = s.chomp_register(',')?;
         if src1.class != RegisterClass::General {
             return Err(WithContext {
                 source: ParseError::WrongRegisterClass {
                     wanted: RegisterClass::General,
                     got: src1.class,
                 },
-                ctx: (idx, 0).into(),
+                ctx,
                 help: None,
             });
         }
-        check_cluster(dst, src1, idx, val_len)?;
-        idx += val_len + 1;
-        let s = trim_start(s, &mut idx);
-        // We're past the , this could either be a register or an immediate
-        let mut splitter = s.split_whitespace();
-        let Some(src2) = splitter.next() else {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        };
-        let val_len = src2.len();
-        let src2: Register = src2.parse().map_err(|r| reg_err(r, idx))?;
+        check_cluster(dst, src1, ctx)?;
+        // We're past the , there's another register
+        let (src2, ctx) = s.chomp_register(' ')?;
         if src2.class != RegisterClass::General {
             return Err(WithContext {
                 source: ParseError::WrongRegisterClass {
                     wanted: RegisterClass::General,
                     got: src2.class,
                 },
-                ctx: (idx, 0).into(),
+                ctx,
                 help: None,
             });
         }
-        check_cluster(dst, src2, idx, val_len)?;
-        idx += val_len + 1;
-        let s = trim_start(splitter.next().unwrap_or_default(), &mut idx);
-        if !s.is_empty() {
-            Err(WithContext {
-                source: ParseError::ExpectedEnd(s.to_owned()),
-                ctx: (idx, s.len()).into(),
-                help: None,
-            })
-        } else {
-            Ok(Self { src1, src2, dst })
-        }
+        check_cluster(dst, src2, ctx)?;
+        s.finish()?;
+        Ok(Self { src1, src2, dst })
     }
 }
 
-impl Info for LogicalArgs {
-    type Opcode = LogicalOpcode;
+impl Info for Args {
+    type Opcode = Opcode;
     fn inputs(&self) -> Vec<super::Location> {
         vec![Location::Register(self.src1), Location::Register(self.src2)]
     }
     fn outputs(&self) -> Vec<Location> {
         vec![Location::Register(self.dst)]
     }
-    fn decode(
-        &self,
-        opcode: LogicalOpcode,
-        machine: &Machine,
-    ) -> Result<Vec<Outcome>, DecodeError> {
+    fn decode(&self, opcode: Opcode, machine: &Machine) -> Result<Vec<Outcome>, DecodeError> {
         // Make sure dst works
         machine.get_reg(self.dst)?;
         let dst = Location::Register(self.dst);
@@ -408,13 +323,14 @@ impl Info for LogicalArgs {
     }
 }
 
-impl Display for LogicalArgs {
+impl Display for Args {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Self { dst, src1, src2 } = self;
         f.write_fmt(format_args!("{dst} = {src1}, {src2}"))
     }
 }
 
+/// Commands for selecting a value based on a condition
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SelectOpcode {
     /// Select the first choice if the condition is **true**; otherwise the second
@@ -424,6 +340,7 @@ pub enum SelectOpcode {
 }
 
 impl SelectOpcode {
+    /// Textual representation of this command
     pub const fn code(self) -> &'static str {
         match self {
             Self::SelectTrue => "slct",
@@ -449,102 +366,65 @@ impl Display for SelectOpcode {
     }
 }
 
+/// Arguments for conditional selection
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SelectArgs {
+    /// Condition to use for choosing. If general purpose, it is
+    /// considered false (`0x0`) if its value is `0`; otherwise, it
+    /// will be considered true (`0x1`)
     pub(super) cond: Register,
+    /// The value to choose if the condition is true
     pub(super) src1: Register,
+    /// The value to choose if the condition is false
     pub(super) src2: Operand,
+    /// The destination register
     pub(super) dst: Register,
 }
 
 impl FromStr for SelectArgs {
     type Err = WithContext<ParseError>;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut idx = 0;
-        let s = trim_start(s, &mut idx);
+        let mut s = ParseState::new(s);
         // Chomp the destination register
-        let Some((dst, s)) = s.split_once('=') else {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        };
-        let val_len = dst.len();
-        let dst: Register = dst.parse().map_err(|r| reg_err(r, idx))?;
+        let (dst, ctx) = s.chomp_register('=')?;
         if dst.class != RegisterClass::General && dst.class != RegisterClass::Branch {
             return Err(WithContext {
                 source: ParseError::WrongRegisterClass {
                     wanted: RegisterClass::Branch,
                     got: dst.class,
                 },
-                ctx: (idx, 0).into(),
+                ctx,
                 help: None,
             });
         }
         // We're past the =, trim and get the conditional register
-        idx += val_len + 1;
-        let s = trim_start(s, &mut idx);
-        let Some((cond, s)) = s.split_once(',') else {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        };
-        let val_len = cond.len();
-        let cond: Register = cond.parse().map_err(|r| reg_err(r, idx))?;
+        let (cond, ctx) = s.chomp_register(',')?;
         if cond.class != RegisterClass::Branch {
             return Err(WithContext {
                 source: ParseError::WrongRegisterClass {
                     wanted: RegisterClass::Branch,
                     got: cond.class,
                 },
-                ctx: (idx, 0).into(),
+                ctx,
                 help: None,
             });
         }
-        check_cluster(dst, cond, idx, val_len)?;
+        check_cluster(dst, cond, ctx)?;
         // We're past the first ,, trim and get the first choice
-        idx += val_len + 1;
-        let s = trim_start(s, &mut idx);
-        let Some((src1, s)) = s.split_once(',') else {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        };
-        let val_len = src1.len();
-        let src1: Register = src1.parse().map_err(|r| reg_err(r, idx))?;
+        let (src1, ctx) = s.chomp_register(',')?;
         if src1.class != RegisterClass::General {
             return Err(WithContext {
                 source: ParseError::WrongRegisterClass {
                     wanted: RegisterClass::General,
                     got: src1.class,
                 },
-                ctx: (idx, 0).into(),
+                ctx,
                 help: None,
             });
         }
-        check_cluster(dst, src1, idx, val_len)?;
-        idx += val_len + 1;
-        let s = trim_start(s, &mut idx);
+        check_cluster(dst, src1, ctx)?;
         // We're past the , this could either be a register or an immediate
-        let mut splitter = s.split_whitespace();
-        let Some(src2) = splitter.next() else {
-            return Err(WithContext {
-                source: ParseError::NoValue,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        };
-        let val_len = src2.len();
-        let src2: Operand = src2.parse().map_err(|op: OperandParseError| WithContext {
-            source: ParseError::BadOperand(src2.to_owned(), op),
-            ctx: (idx, val_len).into(),
-            help: None,
-        })?;
+        let (src2, ctx) = s.chomp_operand(' ')?;
         if let Operand::Register(r) = src2 {
             if r.class != RegisterClass::General {
                 return Err(WithContext {
@@ -552,28 +432,19 @@ impl FromStr for SelectArgs {
                         wanted: RegisterClass::General,
                         got: r.class,
                     },
-                    ctx: (idx, 0).into(),
+                    ctx,
                     help: None,
                 });
             }
-            check_cluster(dst, r, idx, val_len)?;
+            check_cluster(dst, r, ctx)?;
         }
-        idx += val_len + 1;
-        let s = trim_start(splitter.next().unwrap_or_default(), &mut idx);
-        if !s.is_empty() {
-            Err(WithContext {
-                source: ParseError::ExpectedEnd(s.to_owned()),
-                ctx: (idx, s.len()).into(),
-                help: None,
-            })
-        } else {
-            Ok(Self {
-                cond,
-                src1,
-                src2,
-                dst,
-            })
-        }
+        s.finish()?;
+        Ok(Self {
+            cond,
+            src1,
+            src2,
+            dst,
+        })
     }
 }
 
@@ -612,10 +483,10 @@ impl Info for SelectArgs {
                 }
             }
             SelectOpcode::SelectFalse => {
-                if !cond {
-                    src1
-                } else {
+                if cond {
                     src2
+                } else {
+                    src1
                 }
             }
         };
@@ -639,12 +510,11 @@ impl Display for SelectArgs {
 mod test {
     use super::{
         super::test::{display, negative, positive},
-        CompareArgs, CompareOpcode, LogicalArgs, LogicalOpcode,
+        Args, CompareArgs, CompareOpcode, Opcode,
     };
     use crate::{
         machine::test::test_machine,
-        operation::{Info, Location, Operand, Register, RegisterClass},
-        Outcome,
+        operation::{Info, Location, Operand, Outcome, Register, RegisterClass},
     };
     #[test]
     fn compare_parser() {
@@ -791,7 +661,7 @@ mod test {
         positive(&[
             (
                 "$r0.2 = $r0.3, $r0.4",
-                LogicalArgs {
+                Args {
                     dst: Register {
                         cluster: 0,
                         num: 2,
@@ -811,7 +681,7 @@ mod test {
             ),
             (
                 "$b0.2 = $r0.3, $r0.4",
-                LogicalArgs {
+                Args {
                     dst: Register {
                         cluster: 0,
                         num: 2,
@@ -831,7 +701,7 @@ mod test {
             ),
         ]);
 
-        negative::<LogicalArgs, _>(&[
+        negative::<Args, _>(&[
             "$r0.2 = $r0.3, $r0.4 f",
             "$b0.-2 = $r0.3, $r0.4",
             "$r0.2 = $r0.3, r0.4",
@@ -849,7 +719,7 @@ mod test {
         display(&[
             (
                 "$r0.1 = $r0.4, $r0.2",
-                LogicalArgs {
+                Args {
                     src1: Register {
                         cluster: 0,
                         class: RegisterClass::General,
@@ -869,7 +739,7 @@ mod test {
             ),
             (
                 "$b0.1 = $r0.4, $r0.2",
-                LogicalArgs {
+                Args {
                     src1: Register {
                         cluster: 0,
                         class: RegisterClass::General,
@@ -893,7 +763,7 @@ mod test {
     #[test]
     fn logical_decode() {
         let mut machine = test_machine();
-        let args = LogicalArgs {
+        let args = Args {
             src1: Register {
                 cluster: 0,
                 class: RegisterClass::General,
@@ -912,7 +782,7 @@ mod test {
         };
         machine[args.src1] = 0x1;
         machine[args.src2] = 0x1;
-        let res = args.decode(LogicalOpcode::And, &machine);
+        let res = args.decode(Opcode::And, &machine);
         assert!(res.is_ok());
         assert_eq!(
             vec![Outcome {

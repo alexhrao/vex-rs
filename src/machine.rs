@@ -7,11 +7,12 @@ use std::{
     ops::{Index, IndexMut},
 };
 
+use bon::Builder;
 use strum::IntoEnumIterator;
+use thiserror::Error;
 
-use crate::{
-    operation::{Alignment, DecodeError, Location, Operation, Register, RegisterClass},
-    Args, Outcome, ParameterError, Resource,
+use crate::operation::{
+    Alignment, DecodeError, Location, Operation, Outcome, Register, RegisterClass, Resource,
 };
 
 /// The zero register. This one should **never** be written to
@@ -166,14 +167,16 @@ pub enum MemoryValue {
 impl MemoryValue {
     pub fn as_u32(self) -> u32 {
         match self {
-            Self::Byte(b) => b as u32,
-            Self::Half(h) => h as u32,
+            Self::Byte(b) => u32::from(b),
+            Self::Half(h) => u32::from(h),
             MemoryValue::Word(w) => w,
         }
     }
     pub fn new(value: u32, size: Alignment) -> Self {
         match size {
+            #[allow(clippy::cast_possible_truncation)]
             Alignment::Byte => Self::Byte(value as u8),
+            #[allow(clippy::cast_possible_truncation)]
             Alignment::Half => Self::Half(value as u16),
             Alignment::Word => Self::Word(value),
         }
@@ -200,24 +203,135 @@ impl From<&[u8]> for MemoryValue {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Cluster {
-    general: Vec<u32>,
-    branch: Vec<u32>,
+    pub general: Vec<u32>,
+    pub branch: Vec<u32>,
 }
+
+#[derive(Debug)]
+pub struct ClusterConfig {
+    pub num_regs: usize,
+    pub num_branch: usize,
+}
+
+impl TryFrom<ClusterConfig> for Cluster {
+    type Error = ConstructionError;
+    fn try_from(value: ClusterConfig) -> Result<Self, Self::Error> {
+        if value.num_branch <= 1 || value.num_regs == 0 {
+            Err(ConstructionError::ZeroRegisters)
+        } else {
+            Ok(Self {
+                general: vec![0u32; value.num_regs],
+                branch: vec![0u32; value.num_branch],
+            })
+        }
+    }
+}
+
+#[derive(Builder)]
+pub struct Args {
+    pub clusters: Vec<ClusterConfig>,
+    pub num_slots: usize,
+    pub num_alus: usize,
+    pub num_muls: usize,
+    pub num_loads: usize,
+    pub num_stores: usize,
+    pub mem_size: usize,
+    pub alu_latency: usize,
+    pub mul_latency: usize,
+    pub store_latency: usize,
+    pub load_latency: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Error)]
+pub enum ConstructionError {
+    #[error("Resource {0} must have non-zero latency")]
+    ZeroLatency(Resource),
+    #[error("Resource {0} must have non-zero latency")]
+    ZeroCapacity(Resource),
+    #[error("You must have at least one cluster")]
+    ZeroClusters,
+    #[error("All clusters must have a non-zero number of general and branch registers")]
+    ZeroRegisters,
+    #[error("You must have at least one operation slot")]
+    ZeroSlots,
+    #[error("There must be at least 4 bytes of memory")]
+    BadMemory,
+}
+
+impl<'a> TryFrom<Args> for Machine<'a> {
+    type Error = ConstructionError;
+    fn try_from(value: Args) -> Result<Self, Self::Error> {
+
+        let clusters = value.clusters.into_iter()
+            .map(Cluster::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        if value.alu_latency == 0 {
+            return Err(ConstructionError::ZeroLatency(Resource::Arithmetic));
+        }
+        if value.load_latency == 0 {
+            return Err(ConstructionError::ZeroLatency(Resource::Load));
+        }
+        if value.mul_latency == 0 {
+            return Err(ConstructionError::ZeroLatency(Resource::Multiplication));
+        }
+        if value.store_latency == 0 {
+            return Err(ConstructionError::ZeroLatency(Resource::Store));
+        }
+        if value.num_alus == 0 {
+            return Err(ConstructionError::ZeroCapacity(Resource::Arithmetic));
+        }
+        if value.num_loads == 0 {
+            return Err(ConstructionError::ZeroCapacity(Resource::Load));
+        }
+        if value.num_muls == 0 {
+            return Err(ConstructionError::ZeroCapacity(Resource::Multiplication));
+        }
+        if value.num_stores == 0 {
+            return Err(ConstructionError::ZeroCapacity(Resource::Store));
+        }
+        if value.num_slots == 0 {
+            return Err(ConstructionError::ZeroSlots);
+        }
+        if value.mem_size < 4 {
+            return Err(ConstructionError::BadMemory);
+        }
+        Ok(Self {
+            alu_latency: value.alu_latency,
+            alus: Vec::with_capacity(value.num_alus),
+            clusters,
+            load_latency: value.load_latency,
+            loads: Vec::with_capacity(value.num_loads),
+            mem: vec![0u8; value.mem_size],
+            num_slots: value.num_slots,
+            mul_latency: value.mul_latency,
+            muls: Vec::with_capacity(value.num_muls),
+            num_alus: value.num_alus,
+            num_loads: value.num_loads,
+            num_muls: value.num_muls,
+            num_stores: value.num_stores,
+            store_latency: value.store_latency,
+            stores: Vec::with_capacity(value.num_stores),
+            pending_reads: HashMap::new(),
+            pending_writes: HashMap::new(),
+            symbols: HashMap::new(),
+        })
+    }
+}
+
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Machine<'a> {
-    clusters: Vec<Cluster>,
-    /// Memory
-    mem: Vec<u8>,
-    alus: Vec<Issued<'a>>,
-    muls: Vec<Issued<'a>>,
-    loads: Vec<Issued<'a>>,
-    stores: Vec<Issued<'a>>,
     num_slots: usize,
     num_alus: usize,
     num_muls: usize,
     num_loads: usize,
     num_stores: usize,
+    clusters: Vec<Cluster>,
+    mem: Vec<u8>,
+    alus: Vec<Issued<'a>>,
+    muls: Vec<Issued<'a>>,
+    loads: Vec<Issued<'a>>,
+    stores: Vec<Issued<'a>>,
     alu_latency: usize,
     mul_latency: usize,
     store_latency: usize,
@@ -230,6 +344,8 @@ pub struct Machine<'a> {
     /// the value is the operation responsible for the write,
     /// plus cycle in which this write will have finished
     pending_writes: HashMap<Location, Pending<'a>>,
+    /// Symbols that map to addresses (? or are they just constants?)
+    symbols: HashMap<String, usize>,
 }
 
 impl<'a> Index<Register> for Machine<'a> {
@@ -256,7 +372,7 @@ impl<'a> IndexMut<Register> for Machine<'a> {
 }
 
 impl<'a> Machine<'a> {
-    pub fn latency(&self, resource: Resource) -> usize {
+    pub(crate) const fn latency(&self, resource: Resource) -> usize {
         match resource {
             Resource::Arithmetic => self.alu_latency,
             Resource::Multiplication => self.mul_latency,
@@ -264,7 +380,7 @@ impl<'a> Machine<'a> {
             Resource::Store => self.store_latency,
         }
     }
-    pub const fn capacity(&self, resource: Resource) -> usize {
+    pub(crate) const fn capacity(&self, resource: Resource) -> usize {
         match resource {
             Resource::Arithmetic => self.num_alus,
             Resource::Load => self.num_loads,
@@ -272,7 +388,7 @@ impl<'a> Machine<'a> {
             Resource::Multiplication => self.num_muls,
         }
     }
-    pub const fn resource(&self, resource: Resource) -> &Vec<Issued<'a>> {
+    pub(crate) const fn resource(&self, resource: Resource) -> &Vec<Issued<'a>> {
         match resource {
             Resource::Arithmetic => &self.alus,
             Resource::Load => &self.loads,
@@ -393,15 +509,14 @@ impl<'a> Machine<'a> {
 
             // Decode step will check if the inputs or the outputs exceed bounds or are not aligned
             let results = op.action.decode(self).map_err(|de| {
+                let op = op.clone();
                 Box::new(match de {
                     DecodeError::AddressOutOfBounds(addr, align) => {
-                        Violation::MemoryOutOfBounds(op.clone(), addr, align)
+                        Violation::MemoryOutOfBounds(op, addr, align)
                     }
-                    DecodeError::InvalidRegister(r) => {
-                        Violation::RegisterOutOfBounds(op.clone(), r)
-                    }
+                    DecodeError::InvalidRegister(r) => Violation::RegisterOutOfBounds(op, r),
                     DecodeError::MisalignedAccess(addr, align) => {
-                        Violation::UnalignedAddress(op.clone(), addr, align)
+                        Violation::UnalignedAddress(op, addr, align)
                     }
                 })
             })?;
@@ -437,8 +552,7 @@ impl<'a> Machine<'a> {
                     }));
                 }
             }
-            let k = op.action.kind();
-            let r = k.into();
+            let r = op.action.kind();
             let latency = self.latency(r);
             let cap = self.capacity(r);
             let units = self.resource_mut(r);
@@ -463,14 +577,12 @@ impl<'a> Machine<'a> {
             }
             for d in dsts {
                 // Should have already been checked
+
                 if let Some(Pending {
                     operation: prev, ..
                 }) = self.pending_writes.insert(d.sanitize(), pending)
                 {
-                    panic!(
-                        "Pending writes should not have been populated, but was with {}",
-                        prev
-                    );
+                    panic!("Pending writes should not have been populated, but was with {prev}");
                 }
             }
         }
@@ -495,9 +607,10 @@ impl<'a> Machine<'a> {
         // Pending reads and writes
         for c in committed.iter().flat_map(|r| r.results.iter()) {
             c.commit(self);
-            if self.pending_writes.remove(&c.dst).is_none() {
-                panic!("Removed write was not marked as pending: {c}");
-            }
+            assert!(
+                self.pending_writes.remove(&c.dst).is_some(),
+                "Removed write was not marked as pending: {c}"
+            );
         }
         for pending in self.pending_reads.values_mut() {
             pending.retain(|p| p.finished > cycle);
@@ -558,51 +671,6 @@ impl<'a> Display for Machine<'a> {
     }
 }
 
-impl<'a> TryFrom<&Args> for Machine<'a> {
-    type Error = ParameterError;
-    fn try_from(args: &Args) -> Result<Self, Self::Error> {
-        if args.mem_size.get() < 4 {
-            return Err(ParameterError::NotEnoughMemory(args.mem_size.get()));
-        }
-        if (args.mem_size.get() % 4) != 0 {
-            return Err(ParameterError::BadMemoryAlign(args.mem_size.get()));
-        }
-        if args.nums.len() != 10 {
-            return Err(ParameterError::InvalidArguments(args.nums.len()));
-        }
-        let mut mem = vec![0u8; args.mem_size.get()];
-        let mut regs = vec![0u32; args.num_regs.get() + 1];
-        for (m, n) in (0x18..=0x2c).step_by(4).zip(args.nums.iter().skip(1)) {
-            mem[m..m + 4].copy_from_slice(&n.to_be_bytes());
-        }
-        mem[0x30..0x34].copy_from_slice(&args.nums[8].to_be_bytes());
-        regs[3] = args.nums[9];
-        let cluster = Cluster {
-            branch: vec![0u32; args.num_bregs.get()],
-            general: regs,
-        };
-        Ok(Machine {
-            mem,
-            clusters: vec![cluster],
-            num_slots: args.num_slots.get(),
-            num_alus: args.alu_slots.get(),
-            alu_latency: args.alu_latency.get(),
-            num_muls: args.mul_slots.get(),
-            mul_latency: args.mul_latency.get(),
-            num_loads: args.load_slots.get(),
-            num_stores: args.store_slots.get(),
-            load_latency: args.load_latency.get(),
-            store_latency: args.store_latency.get(),
-            alus: Vec::with_capacity(args.alu_slots.get()),
-            loads: Vec::with_capacity(args.load_slots.get()),
-            stores: Vec::with_capacity(args.store_slots.get()),
-            muls: Vec::with_capacity(args.mul_slots.get()),
-            pending_reads: HashMap::new(),
-            pending_writes: HashMap::new(),
-        })
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod test {
     use std::collections::HashMap;
@@ -630,6 +698,7 @@ pub(crate) mod test {
             load_latency: 3,
             pending_reads: HashMap::new(),
             pending_writes: HashMap::new(),
+            symbols: HashMap::new(),
         }
     }
 }

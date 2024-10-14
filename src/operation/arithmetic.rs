@@ -1,15 +1,14 @@
+//! Arithmetic Operations
 use std::{fmt::Display, str::FromStr};
 
-use crate::{Location, Machine, Outcome, Resource};
-
 use super::{
-    check_cluster, reg_err, trim_start, DecodeError, Info, Operand, OperandParseError,
-    ParseError, Register, RegisterClass, WithContext,
+    check_cluster, DecodeError, Info, Location, Machine, Operand, Outcome, ParseError, ParseState,
+    Register, RegisterClass, Resource, WithContext,
 };
 
 /// Basic Opcodes for Arithmetic
 ///
-/// "Basic" here means that is follows the [`BasicArgs`] convention;
+/// "Basic" here means that is follows the [`Args`] convention;
 /// in other words, an instruction of the form
 ///
 /// ```asm
@@ -19,7 +18,7 @@ use super::{
 /// This encompasses most of the arithmetic operations, including all
 /// multiplicative ones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumIter)]
-pub enum BasicOpcode {
+pub enum Opcode {
     /// Add two unsigned numbers together
     Add,
     /// Bitwise AND
@@ -82,12 +81,12 @@ pub enum BasicOpcode {
     MultiplyHighUnsigned,
     /// Multiply the higher 16 bits of the second source by the full 32 bits
     /// of the first source, treating both as **signed**. However, this differs
-    /// from [`MultiplyHigh`](`BasicOpcode::MultiplyHigh`) in that the higher
+    /// from [`MultiplyHighSigned`](`Opcode::MultiplyHighSigned`) in that the higher
     /// 16 bits are shifted back into the higher position before multiplication
     MultiplyHighShift,
 }
 
-impl BasicOpcode {
+impl Opcode {
     /// The opcode for this basic operation
     pub const fn code(self) -> &'static str {
         match self {
@@ -122,10 +121,13 @@ impl BasicOpcode {
         }
     }
     /// Execute the operation using the two 32-bit numbers
-    pub fn execute(&self, a: u32, b: u32) -> u32 {
+    pub fn execute(self, a: u32, b: u32) -> u32 {
+        #[allow(clippy::cast_possible_wrap)]
+        #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
         const fn lower_signed(r: u32) -> i32 {
             (((r as i32) << 16) & (0xffff_0000_u32 as i32)) >> 16
         }
+        #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
         const fn higher_signed(r: u32) -> i32 {
             ((r as i32) >> 16) & (0xffffu32 as i32)
         }
@@ -133,20 +135,28 @@ impl BasicOpcode {
             Self::Add => a.wrapping_add(b),
             Self::And => a & b,
             Self::AndComplement => (!a) & b,
+            #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
             Self::MaxSigned => ((a as i32).max(b as i32)) as u32,
             Self::MaxUnsigned => a.max(b),
+            #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
             Self::MinSigned => ((a as i32).min(b as i32)) as u32,
             Self::MinUnsigned => a.min(b),
+            #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
             Self::MultiplyHighSigned => ((a as i32).wrapping_mul(higher_signed(b))) as u32,
+            #[allow(clippy::cast_sign_loss)]
             Self::MultiplyHighHighSigned => {
                 (higher_signed(a).wrapping_mul(higher_signed(b))) as u32
             }
             Self::MultiplyHighHighUnsigned => ((a >> 16) & 0xffff).wrapping_mul((b >> 16) & 0xffff),
+            #[allow(clippy::cast_sign_loss)]
             Self::MultiplyHighShift => a.wrapping_mul(((b >> 16) as i16) as u32),
             Self::MultiplyHighUnsigned => a.wrapping_mul((b >> 16) & 0xffff),
+            #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
             Self::MultiplyLowSigned => ((a as i32).wrapping_mul(lower_signed(b))) as u32,
+            #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
             Self::MultiplyLowHighSigned => (lower_signed(a).wrapping_mul(higher_signed(b))) as u32,
             Self::MultiplyLowHighUnsigned => (a & 0xffff).wrapping_mul((b >> 16) & 0xffff),
+            #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
             Self::MultiplyLowLowSigned => (lower_signed(a).wrapping_mul(lower_signed(b))) as u32,
             Self::MultiplyLowLowUnsigned => (a & 0xffff).wrapping_mul(b & 0xffff),
             Self::MultiplyLowUnsigned => a.wrapping_mul(b & 0xffff),
@@ -157,12 +167,13 @@ impl BasicOpcode {
             Self::Shift3Add => (a << 3).wrapping_add(b),
             Self::Shift4Add => (a << 4).wrapping_add(b),
             Self::ShiftLeft => a << b,
+            #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
             Self::ShiftRightSigned => ((a as i32) >> b) as u32,
             Self::ShiftRightUnsigned => a >> b,
             Self::Xor => a ^ b,
         }
     }
-    /// Get the kind of this opcode
+    /// Get the resource of this opcode
     pub const fn kind(self) -> Resource {
         match self {
             Self::MultiplyHighSigned
@@ -181,7 +192,7 @@ impl BasicOpcode {
     }
 }
 
-impl FromStr for BasicOpcode {
+impl FromStr for Opcode {
     type Err = ();
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
@@ -218,7 +229,7 @@ impl FromStr for BasicOpcode {
     }
 }
 
-impl Display for BasicOpcode {
+impl Display for Opcode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.code())
     }
@@ -230,7 +241,7 @@ impl Display for BasicOpcode {
 /// a destination register, a source register, and a second operand,
 /// which will either be an immediate value or a register.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct BasicArgs {
+pub struct Args {
     /// The first input register
     pub(super) src1: Register,
     /// The second argument, either a register or an immediate
@@ -239,71 +250,37 @@ pub struct BasicArgs {
     pub(super) dst: Register,
 }
 
-impl FromStr for BasicArgs {
+impl FromStr for Args {
     type Err = WithContext<ParseError>;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut idx = 0;
-        let s = trim_start(s, &mut idx);
+        let mut s = ParseState::new(s);
         // Chomp the destination register
-        let Some((dst, s)) = s.split_once('=') else {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        };
-        let val_len = dst.len();
-        let dst: Register = dst.parse().map_err(|r| reg_err(r, idx))?;
+        let (dst, ctx) = s.chomp_register('=')?;
         if dst.class != RegisterClass::General {
             return Err(WithContext {
                 source: ParseError::WrongRegisterClass {
                     wanted: RegisterClass::General,
                     got: dst.class,
                 },
-                ctx: (idx, 0).into(),
+                ctx,
                 help: None,
             });
         }
-        // We're past the =, trim and get the first register
-        idx += val_len + 1;
-        let s = trim_start(s, &mut idx);
-        let Some((src1, s)) = s.split_once(',') else {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        };
-        let val_len = src1.len();
-        let src1: Register = src1.parse().map_err(|r| reg_err(r, idx))?;
+        // Get the first source
+        let (src1, ctx) = s.chomp_register(',')?;
         if src1.class != RegisterClass::General {
             return Err(WithContext {
                 source: ParseError::WrongRegisterClass {
                     wanted: RegisterClass::General,
                     got: src1.class,
                 },
-                ctx: (idx, 0).into(),
+                ctx,
                 help: None,
             });
         }
-        check_cluster(dst, src1, idx, val_len)?;
-        idx += val_len + 1;
-        let s = trim_start(s, &mut idx);
+        check_cluster(dst, src1, ctx)?;
         // We're past the , this could either be a register or an immediate
-        let mut splitter = s.split_whitespace();
-        let Some(src2) = splitter.next() else {
-            return Err(WithContext {
-                source: ParseError::NoValue,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        };
-        let val_len = src2.len();
-        let src2: Operand = src2.parse().map_err(|op: OperandParseError| WithContext {
-            source: ParseError::BadOperand(src2.to_owned(), op),
-            ctx: (idx, val_len).into(),
-            help: None,
-        })?;
+        let (src2, ctx) = s.chomp_operand(' ')?;
         if let Operand::Register(r) = src2 {
             if r.class != RegisterClass::General {
                 return Err(WithContext {
@@ -311,28 +288,19 @@ impl FromStr for BasicArgs {
                         wanted: RegisterClass::General,
                         got: r.class,
                     },
-                    ctx: (idx, 0).into(),
+                    ctx,
                     help: None,
                 });
             }
-            check_cluster(dst, r, idx, val_len)?;
+            check_cluster(dst, r, ctx)?;
         }
-        idx += val_len + 1;
-        let s = trim_start(splitter.next().unwrap_or_default(), &mut idx);
-        if !s.is_empty() {
-            Err(WithContext {
-                source: ParseError::ExpectedEnd(s.to_owned()),
-                ctx: (idx, s.len()).into(),
-                help: None,
-            })
-        } else {
-            Ok(Self { src1, src2, dst })
-        }
+        s.finish()?;
+        Ok(Self { src1, src2, dst })
     }
 }
 
-impl Info for BasicArgs {
-    type Opcode = BasicOpcode;
+impl Info for Args {
+    type Opcode = Opcode;
     fn inputs(&self) -> Vec<Location> {
         match self.src2 {
             Operand::Immediate(_) => vec![Location::Register(self.src1)],
@@ -344,7 +312,7 @@ impl Info for BasicArgs {
     fn outputs(&self) -> Vec<Location> {
         vec![Location::Register(self.dst)]
     }
-    fn decode(&self, opcode: BasicOpcode, machine: &Machine) -> Result<Vec<Outcome>, DecodeError> {
+    fn decode(&self, opcode: Opcode, machine: &Machine) -> Result<Vec<Outcome>, DecodeError> {
         // Make sure dst works
         machine.get_reg(self.dst)?;
         let dst = Location::Register(self.dst);
@@ -353,28 +321,29 @@ impl Info for BasicArgs {
     }
 }
 
-impl Display for BasicArgs {
+impl Display for Args {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Self { dst, src1, src2 } = self;
         f.write_fmt(format_args!("{dst} = {src1}, {src2}"))
     }
 }
 
+/// Opcodes for operations that involve a carry bit
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum CarryOpcode {
+    /// Add two numbers in addition to a carry bit
     AddCarry,
+    /// Divide a number by another number
     Divide,
 }
 
 impl CarryOpcode {
-    pub const fn code(&self) -> &'static str {
+    /// Get the textual representation of this opcode
+    pub const fn code(self) -> &'static str {
         match self {
             Self::AddCarry => "addcg",
             Self::Divide => "divs",
         }
-    }
-    pub const fn kind(&self) -> Resource {
-        Resource::Arithmetic
     }
 }
 
@@ -395,150 +364,97 @@ impl FromStr for CarryOpcode {
     }
 }
 
+/// Arguments for operations that have carry bits
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct CarryArgs {
+    /// The first source register. This should be a [general-purpose register](`RegisterClass::General`)
     pub(super) src1: Register,
+    /// The second source register. This should be a [general-purpose register](`RegisterClass::General`)
     pub(super) src2: Register,
+    /// The carry-in bit. This should be a **[branch register](`RegisterClass::Branch`)**
     pub(super) cin: Register,
+    /// The destination register. This should be a [general-purpose register](`RegisterClass::General`)
     pub(super) dst: Register,
+    /// The carry-out bit. This should be a **[branch register](`RegisterClass::Branch`)**
     pub(super) cout: Register,
 }
 
 impl FromStr for CarryArgs {
     type Err = WithContext<ParseError>;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut idx = 0;
-        let s = trim_start(s, &mut idx);
+        let mut s = ParseState::new(s);
         // Chomp the first destination register
-        let Some((dst, s)) = s.split_once(',') else {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        };
-        let val_len = dst.len();
-        let dst: Register = dst.parse().map_err(|r| reg_err(r, idx))?;
+        let (dst, ctx) = s.chomp_register(',')?;
         if dst.class != RegisterClass::General {
             return Err(WithContext {
                 source: ParseError::WrongRegisterClass {
                     wanted: RegisterClass::General,
                     got: dst.class,
                 },
-                ctx: (idx, 0).into(),
+                ctx,
                 help: None,
             });
         }
-        // We're past the ',', trim and get the second output register
-        idx += val_len + 1;
-        let s = trim_start(s, &mut idx);
-        let Some((cout, s)) = s.split_once('=') else {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        };
-        let val_len = cout.len();
-        let cout: Register = cout.parse().map_err(|r| reg_err(r, idx))?;
+        // Chomp cout
+        let (cout, ctx) = s.chomp_register('=')?;
         if cout.class != RegisterClass::Branch {
             return Err(WithContext {
                 source: ParseError::WrongRegisterClass {
                     wanted: RegisterClass::Branch,
                     got: cout.class,
                 },
-                ctx: (idx, 0).into(),
+                ctx,
                 help: None,
             });
         }
-        check_cluster(dst, cout, idx, val_len)?;
-        idx += val_len + 1;
-        let s = trim_start(s, &mut idx);
+        check_cluster(dst, cout, ctx)?;
         // We're past the =, get the input registers
-        let Some((cin, s)) = s.split_once(',') else {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        };
-        let val_len = cin.len();
-        let cin: Register = cin.parse().map_err(|r| reg_err(r, idx))?;
+        let (cin, ctx) = s.chomp_register(',')?;
         if cin.class != RegisterClass::Branch {
             return Err(WithContext {
                 source: ParseError::WrongRegisterClass {
                     wanted: RegisterClass::Branch,
                     got: cin.class,
                 },
-                ctx: (idx, 0).into(),
+                ctx,
                 help: None,
             });
         }
-        check_cluster(dst, cin, idx, val_len)?;
-        idx += val_len + 1;
-        let s = trim_start(s, &mut idx);
+        check_cluster(dst, cin, ctx)?;
         // Register s1
-        let Some((src1, s)) = s.split_once(',') else {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        };
-        let val_len = src1.len();
-        let src1: Register = src1.parse().map_err(|r| reg_err(r, idx))?;
+        let (src1, ctx) = s.chomp_register(',')?;
         if src1.class != RegisterClass::General {
             return Err(WithContext {
                 source: ParseError::WrongRegisterClass {
                     wanted: RegisterClass::General,
                     got: src1.class,
                 },
-                ctx: (idx, 0).into(),
+                ctx,
                 help: None,
             });
         }
-        check_cluster(dst, src1, idx, val_len)?;
-        idx += val_len + 1;
-        let s = trim_start(s, &mut idx);
+        check_cluster(dst, src1, ctx)?;
         // Register s2
-        let mut splitter = s.split_whitespace();
-        let Some(src2) = splitter.next() else {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        };
-        let val_len = src2.len();
-        let src2: Register = src2.parse().map_err(|r| reg_err(r, idx))?;
+        let (src2, ctx) = s.chomp_register(' ')?;
         if src2.class != RegisterClass::General {
             return Err(WithContext {
                 source: ParseError::WrongRegisterClass {
                     wanted: RegisterClass::General,
                     got: src2.class,
                 },
-                ctx: (idx, 0).into(),
+                ctx,
                 help: None,
             });
         }
-        check_cluster(dst, src2, idx, val_len)?;
-        idx += val_len + 1;
-        let s = trim_start(splitter.next().unwrap_or_default(), &mut idx);
-        if !s.is_empty() {
-            Err(WithContext {
-                source: ParseError::ExpectedEnd(s.to_owned()),
-                ctx: (idx, s.len()).into(),
-                help: None,
-            })
-        } else {
-            Ok(Self {
-                dst,
-                cout,
-                cin,
-                src1,
-                src2,
-            })
-        }
+        check_cluster(dst, src2, ctx)?;
+        s.finish()?;
+        Ok(Self {
+            src1,
+            src2,
+            cin,
+            dst,
+            cout,
+        })
     }
 }
 
@@ -564,15 +480,9 @@ impl Info for CarryArgs {
                 let cin = machine.get_reg(self.cin)? & 0x1;
                 let res = s1 + machine.get_reg(self.src2)? + cin;
                 let carry = if cin == 1 {
-                    if res <= s1 {
-                        1u32
-                    } else {
-                        0u32
-                    }
-                } else if res < s1 {
-                    1u32
+                    u32::from(res <= s1)
                 } else {
-                    0u32
+                    u32::from(res < s1)
                 };
                 // Check destinations
                 machine.get_reg(self.dst)?;
@@ -627,54 +537,35 @@ impl Info for CarryArgs {
     }
 }
 
+/// Arguments for the subtract operation
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SubArgs {
+    /// The first source
     pub(super) src1: Operand,
+    /// The second source
     pub(super) src2: Register,
+    /// The destination register
     pub(super) dst: Register,
 }
 
 impl FromStr for SubArgs {
     type Err = WithContext<ParseError>;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut idx = 0;
-        let s = trim_start(s, &mut idx);
+        let mut s = ParseState::new(s);
         // Chomp the destination register
-        let Some((dst, s)) = s.split_once('=') else {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        };
-        let val_len = dst.len();
-        let dst: Register = dst.parse().map_err(|r| reg_err(r, idx))?;
+        let (dst, ctx) = s.chomp_register('=')?;
         if dst.class != RegisterClass::General {
             return Err(WithContext {
                 source: ParseError::WrongRegisterClass {
                     wanted: RegisterClass::General,
                     got: dst.class,
                 },
-                ctx: (idx, 0).into(),
+                ctx,
                 help: None,
             });
         }
-        // We're past the =, trim and get the first operand (either register or immediate)
-        idx += val_len + 1;
-        let s = trim_start(s, &mut idx);
-        let Some((src1, s)) = s.split_once(',') else {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        };
-        let val_len = src1.len();
-        let src1: Operand = src1.parse().map_err(|op: OperandParseError| WithContext {
-            source: ParseError::BadOperand(src1.to_owned(), op),
-            ctx: (idx, val_len).into(),
-            help: None,
-        })?;
+        // We're past the =. Now it's an operand
+        let (src1, ctx) = s.chomp_operand(',')?;
         if let Operand::Register(r) = src1 {
             if r.class != RegisterClass::General {
                 return Err(WithContext {
@@ -682,46 +573,27 @@ impl FromStr for SubArgs {
                         wanted: RegisterClass::General,
                         got: r.class,
                     },
-                    ctx: (idx, 0).into(),
+                    ctx,
                     help: None,
                 });
             }
-            check_cluster(dst, r, idx, val_len)?;
+            check_cluster(dst, r, ctx)?;
         }
-        idx += val_len + 1;
         // We're past the first operand. At this point it better be a register
-        let mut splitter = s.split_whitespace();
-        let Some(src2) = splitter.next() else {
-            return Err(WithContext {
-                source: ParseError::NoValue,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        };
-        let val_len = src2.len();
-        let src2: Register = src2.parse().map_err(|r| reg_err(r, idx))?;
+        let (src2, ctx) = s.chomp_register(' ')?;
         if src2.class != RegisterClass::General {
             return Err(WithContext {
                 source: ParseError::WrongRegisterClass {
                     wanted: RegisterClass::General,
                     got: src2.class,
                 },
-                ctx: (idx, 0).into(),
+                ctx,
                 help: None,
             });
         }
-        check_cluster(dst, src2, idx, val_len)?;
-        idx += val_len + 1;
-        let s = trim_start(splitter.next().unwrap_or_default(), &mut idx);
-        if !s.is_empty() {
-            Err(WithContext {
-                source: ParseError::ExpectedEnd(s.to_owned()),
-                ctx: (idx, s.len()).into(),
-                help: None,
-            })
-        } else {
-            Ok(Self { src1, src2, dst })
-        }
+        check_cluster(dst, src2, ctx)?;
+        s.finish()?;
+        Ok(Self { src1, src2, dst })
     }
 }
 
@@ -757,15 +629,21 @@ impl Display for SubArgs {
     }
 }
 
+/// Opcodes for extension operations
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ExtendOpcode {
+    /// Extend a signed byte
     Byte,
+    /// Extend a signed short
     Half,
+    /// Zero-extend a byte
     ZeroByte,
+    /// Zero-extend a short
     ZeroHalf,
 }
 
 impl ExtendOpcode {
+    /// Get a textual representation of this opcode
     pub const fn code(self) -> &'static str {
         match self {
             Self::Byte => "sxtb",
@@ -795,72 +673,46 @@ impl FromStr for ExtendOpcode {
     }
 }
 
+/// Arguments for extension operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ExtendArgs {
+    /// The value to extend
     src: Register,
+    /// The destination register
     dst: Register,
 }
 
 impl FromStr for ExtendArgs {
     type Err = WithContext<ParseError>;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut idx = 0;
-        let s = trim_start(s, &mut idx);
+        let mut s = ParseState::new(s);
+        let (dst, ctx) = s.chomp_register('=')?;
         // Chomp the destination register
-        let Some((dst, s)) = s.split_once('=') else {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        };
-        let val_len = dst.len();
-        let dst: Register = dst.parse().map_err(|r| reg_err(r, idx))?;
         if dst.class != RegisterClass::General {
             return Err(WithContext {
                 source: ParseError::WrongRegisterClass {
                     wanted: RegisterClass::General,
                     got: dst.class,
                 },
-                ctx: (idx, 0).into(),
+                ctx,
                 help: None,
             });
         }
-        // We're past the =, trim and get the first register
-        idx += val_len + 1;
-        let s = trim_start(s, &mut idx);
-        let mut splitter = s.split_whitespace();
-        let Some(src) = splitter.next() else {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        };
-        let val_len = src.len();
-        let src: Register = src.parse().map_err(|r| reg_err(r, idx))?;
+        // We're past the =. Only one register left to go
+        let (src, ctx) = s.chomp_register(' ')?;
         if src.class != RegisterClass::General {
             return Err(WithContext {
                 source: ParseError::WrongRegisterClass {
                     wanted: RegisterClass::General,
                     got: src.class,
                 },
-                ctx: (idx, 0).into(),
+                ctx,
                 help: None,
             });
         }
-        check_cluster(dst, src, idx, val_len)?;
-        idx += val_len + 1;
-        let s = trim_start(splitter.next().unwrap_or_default(), &mut idx);
-        if !s.is_empty() {
-            Err(WithContext {
-                source: ParseError::ExpectedEnd(s.to_owned()),
-                ctx: (idx, s.len()).into(),
-                help: None,
-            })
-        } else {
-            Ok(Self { src, dst })
-        }
+        check_cluster(dst, src, ctx)?;
+        s.finish()?;
+        Ok(Self { src, dst })
     }
 }
 
@@ -884,13 +736,15 @@ impl Info for ExtendArgs {
         let value = match opcode {
             ExtendOpcode::ZeroByte => src & 0xff,
             ExtendOpcode::ZeroHalf => src & 0xffff,
+            #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
             ExtendOpcode::Byte => (((src << 24) as i32) >> 24) as u32,
+            #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
             ExtendOpcode::Half => (((src << 16) as i32) >> 16) as u32,
         };
         let dst = Location::Register(self.dst);
         // Check the destination
         machine.get_reg(self.dst)?;
-        Ok(vec![Outcome { dst, value }])
+        Ok(vec![Outcome { value, dst }])
     }
 }
 
@@ -898,19 +752,20 @@ impl Info for ExtendArgs {
 mod test {
     use super::{
         super::test::{display, negative, positive},
-        BasicArgs, BasicOpcode, CarryArgs, ExtendArgs,
+        Args, CarryArgs, ExtendArgs, Opcode,
     };
     use crate::{
         machine::test::test_machine,
-        operation::{arithmetic::SubArgs, Info, Location, Operand, Register, RegisterClass},
-        Outcome,
+        operation::{
+            arithmetic::SubArgs, Info, Location, Operand, Outcome, Register, RegisterClass,
+        },
     };
     #[test]
     fn basic_parser() {
         positive(&[
             (
                 "$r0.2 = $r0.3, $r0.4",
-                BasicArgs {
+                Args {
                     dst: Register {
                         cluster: 0,
                         num: 2,
@@ -930,7 +785,7 @@ mod test {
             ),
             (
                 "$r0.2 = $r0.3,5",
-                BasicArgs {
+                Args {
                     dst: Register {
                         cluster: 0,
                         num: 2,
@@ -946,7 +801,7 @@ mod test {
             ),
             (
                 "$r0.2 =$r0.3, 0x20 ",
-                BasicArgs {
+                Args {
                     dst: Register {
                         cluster: 0,
                         num: 2,
@@ -962,7 +817,7 @@ mod test {
             ),
         ]);
 
-        negative::<BasicArgs, _>(&[
+        negative::<Args, _>(&[
             "$r0.2 = $r0.3, $r0.4 f",
             "$r0.-2 = $r0.3, $r0.4",
             "$r0.2 = $r0.3, r0.4",
@@ -981,7 +836,7 @@ mod test {
         display(&[
             (
                 "$r0.1 = $r0.4, $r0.2",
-                BasicArgs {
+                Args {
                     src1: Register {
                         cluster: 0,
                         class: RegisterClass::General,
@@ -1001,7 +856,7 @@ mod test {
             ),
             (
                 "$r0.1 = $r0.4, 0x20",
-                BasicArgs {
+                Args {
                     src1: Register {
                         cluster: 0,
                         class: RegisterClass::General,
@@ -1021,7 +876,7 @@ mod test {
     #[test]
     fn basic_decode() {
         let mut machine = test_machine();
-        let args = BasicArgs {
+        let args = Args {
             src1: Register {
                 cluster: 0,
                 class: RegisterClass::General,
@@ -1035,7 +890,7 @@ mod test {
             },
         };
         machine[args.src1] = 0xff;
-        let res = args.decode(BasicOpcode::Or, &machine);
+        let res = args.decode(Opcode::Or, &machine);
         assert!(res.is_ok());
         assert_eq!(
             vec![Outcome {

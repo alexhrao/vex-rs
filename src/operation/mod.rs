@@ -7,7 +7,7 @@ use regex::Regex;
 use strum::IntoEnumIterator;
 use thiserror::Error;
 
-use crate::{Machine, Outcome, Resource};
+use crate::machine::{Machine, MemoryValue};
 
 mod arithmetic;
 mod help;
@@ -31,7 +31,61 @@ trait Info: Display {
     fn outputs(&self) -> Vec<Location>;
 }
 
-/// Memory Alignment. It is an error to read a value from an unaligned address
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumIter)]
+pub enum Resource {
+    Arithmetic,
+    Multiplication,
+    Load,
+    Store,
+}
+
+impl Display for Resource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Arithmetic => "Arithmetic & Logic",
+            Self::Load => "Memory Load",
+            Self::Store => "Memory Store",
+            Self::Multiplication => "Multiplier",
+        })
+    }
+}
+
+/// Describes how a result should be committed
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Outcome {
+    /// The value to be committed
+    pub(crate) value: u32,
+    /// The location to store
+    pub(crate) dst: Location,
+}
+
+impl Outcome {
+    /// Commit this outcome to memory or the register bank
+    pub fn commit(&self, machine: &mut Machine) {
+        match self.dst {
+            // Alignment has already been checked
+            Location::Memory(m, a) => {
+                machine
+                    .write_memory(m, MemoryValue::new(self.value, a))
+                    .unwrap();
+            }
+            Location::Register(r) => {
+                machine[r] = self.value;
+            }
+        }
+    }
+}
+
+impl Display for Outcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("{} = {}", self.dst, self.value))
+    }
+}
+
+/// Memory Alignment
+///
+/// It is an error to read memory from an unaligned address. This represents
+/// the expected alignment an address must respect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum Alignment {
     /// Byte-aligned; any address is valid
@@ -45,7 +99,7 @@ pub enum Alignment {
 
 impl Alignment {
     /// The offset this alignment implies
-    pub fn offset(self) -> usize {
+    pub const fn offset(self) -> usize {
         match self {
             Alignment::Byte => 1,
             Alignment::Half => 2,
@@ -64,21 +118,30 @@ impl Display for Alignment {
     }
 }
 
+/// An error that occurred during the decoding of an instruction
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
 pub enum DecodeError {
-    #[error("Register {0} does not exist")]
+    /// An invalid (non-existent) register was referenced, or is not
+    /// writeable
+    #[error("Register {0} either does not exist, or is not writeable")]
     InvalidRegister(Register),
+    /// The address was out of bounds with respect to the given alignment
     #[error("Address 0x{0:04x} is out of bounds for accessing a {1}")]
     AddressOutOfBounds(usize, Alignment),
+    /// The address did not respect the necessary alignment
     #[error("Address 0x{0:04x} is not aligned to the {1} boundary")]
     MisalignedAccess(usize, Alignment),
 }
 
+/// An error with source context
 #[derive(Debug, Clone, Error, PartialEq, Eq, Hash)]
 #[error("{source}")]
 pub struct WithContext<S> {
+    /// The error that occurred
     pub source: S,
+    /// The context (e.g., where in the source code)
     pub ctx: SourceSpan,
+    /// Helpful information for the end-user, if any
     pub help: Option<Cow<'static, str>>,
 }
 
@@ -88,13 +151,22 @@ impl<S> WithContext<S> {
     }
 }
 
+/// An argument that is either a register or an immediate
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Operand {
+    /// A named register
     Register(Register),
+    /// A literal 32-bit unsigned value
     Immediate(u32),
 }
 
 impl Operand {
+    /// Resolve this to a value
+    ///
+    /// This will attempt to resolve the operand to a 32-bit unsigned
+    /// value. If it is an immediate, this is guaranteed to succeed.
+    /// However, if it is a register that does not exist, then this
+    /// will fail with a [`DecodeError::InvalidRegister`] error.
     pub fn resolve(self, machine: &Machine) -> Result<u32, DecodeError> {
         match self {
             Self::Register(r) => machine.get_reg(r),
@@ -112,6 +184,7 @@ impl Display for Operand {
     }
 }
 
+/// An error that occurred when parsing an operand
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("{0}")]
 pub struct OperandParseError(RegisterParseError, #[source] ParseIntError);
@@ -129,10 +202,22 @@ impl FromStr for Operand {
     }
 }
 
+/// Class of a register
+///
+/// While all registers are 32-bit containers, the class
+/// of a register determines what kinds of values it is
+/// allowed to use, and perhaps more importantly, what
+/// contexts the register is allowed to appear in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RegisterClass {
+    /// A general-purpose register. This is the most widespread
+    /// register class
     General,
+    /// A single-bit register. This is typically used for comparison
+    /// and branching instructions
     Branch,
+    /// The link register. This is used for navigating around code at
+    /// runtime
     Link,
 }
 
@@ -158,11 +243,22 @@ impl Display for RegisterClass {
     }
 }
 
+/// A single register
+///
+/// A register is a 32-bit container that, depending on
+/// its class, can hold different values and be used
+/// in different contexts.
+///
+/// A register lives inside a cluster. Typically, an operation will
+/// require that all referenced registers reside in the same cluster.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Register {
-    pub(crate) cluster: usize,
-    pub(crate) num: usize,
-    pub(crate) class: RegisterClass,
+    /// The cluster that this register belongs to
+    pub cluster: usize,
+    /// The zero-based index of this register
+    pub num: usize,
+    /// The class of register
+    pub class: RegisterClass,
 }
 
 impl Display for Register {
@@ -176,17 +272,29 @@ impl Display for Register {
     }
 }
 
-#[derive(Debug, Clone, Copy, Error, PartialEq, Eq, Hash)]
+/// An error that occurred during register parsing
+#[derive(Debug, Clone, Error, PartialEq, Eq, Hash)]
 pub enum RegisterParseError {
+    /// An unexpected character was encountered while parsing
     #[error("Expected `{expected}`{got}")]
     UnexpectedChar {
-        expected: char,
-        got: UnexpectedValue,
+        expected: ExpectedValue<char>,
+        got: UnexpectedValue<char>,
     },
+    /// The class was invalid
     #[error("Invalid register class: Must be one of `r`, `b`, or `l`")]
     Class,
+    /// The cluster isn't valid. Note that just because the cluster is
+    /// valid, does **not** mean the cluster is correct. If the machine
+    /// this register is associated with does not have the referenced
+    /// cluster, this register will fail to be used at runtime. See
+    /// [`DecodeError::InvalidRegister`] for more details.
     #[error("Invalid cluster")]
     Cluster,
+    /// The register index is invalid. Note that, as with the cluster, just
+    /// because the register index is _valid_ does not mean it is correct;
+    /// if the index exceeds the bounds of the machine's registers, it will
+    /// fail at runtime. See [`DecodeError::InvalidRegister`] for more details.
     #[error("Invalid register number")]
     Number,
 }
@@ -194,16 +302,18 @@ pub enum RegisterParseError {
 impl FromStr for Register {
     type Err = WithContext<RegisterParseError>;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut idx = 0;
-        let s = trim_start(s, &mut idx);
-        // Better be a $
+        let mut s = ParseState::new(s);
+        s.trim_start();
+        let ParseState { s, mut idx } = s;
+        // Better be a $. Don't use `expect` because it returns a generic
+        // ParseError, not a RegisterParseError
         if !s.starts_with('$') {
             return Err(WithContext {
                 source: RegisterParseError::UnexpectedChar {
-                    got: UnexpectedValue(s.chars().next()),
-                    expected: '$',
+                    got: s.chars().next().into(),
+                    expected: '$'.into(),
                 },
-                ctx: (idx, 0).into(),
+                ctx: idx.into(),
                 help: None,
             });
         }
@@ -213,7 +323,7 @@ impl FromStr for Register {
         let Some(Ok(class)) = s.chars().next().map(|c| c.to_string().parse()) else {
             return Err(WithContext {
                 source: RegisterParseError::Class,
-                ctx: (idx, 0).into(),
+                ctx: idx.into(),
                 help: None,
             });
         };
@@ -223,12 +333,11 @@ impl FromStr for Register {
         let Some((cluster, s)) = s.split_once('.') else {
             return Err(WithContext {
                 source: RegisterParseError::Cluster,
-                ctx: (idx, 0).into(),
-                help: Some("All registers must have a cluster".into()),
+                ctx: idx.into(),
+                help: Some(help::NO_REG_CLUSTER),
             });
         };
         let val_len = cluster.len();
-        idx += val_len + 1;
         let Ok(cluster) = cluster.parse() else {
             return Err(WithContext {
                 source: RegisterParseError::Cluster,
@@ -236,8 +345,18 @@ impl FromStr for Register {
                 help: None,
             });
         };
-        let s = trim_start(s, &mut idx).trim();
-        let Ok(num) = s.parse() else {
+        idx += val_len + 1;
+        let mut s = ParseState { s, idx };
+        s.trim_start();
+        let ParseState { s, idx } = s;
+        let Some(num) = s.split_whitespace().next() else {
+            return Err(WithContext {
+                source: RegisterParseError::Number,
+                ctx: idx.into(),
+                help: None,
+            });
+        };
+        let Ok(num) = num.parse() else {
             return Err(WithContext {
                 source: RegisterParseError::Number,
                 ctx: (idx, s.len()).into(),
@@ -252,13 +371,23 @@ impl FromStr for Register {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Where a value lives
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
 pub enum Location {
+    /// The value lives in the specified register
     Register(Register),
+    /// The value lives in memory, at the given address
+    /// and with the given alignment.
     Memory(usize, Alignment),
 }
 
 impl Location {
+    /// Sanitize a location
+    ///
+    /// We won't know until runtime where in memory a read
+    /// will occur. This method will ensure that all memory
+    /// operations appear to target the exact same address, to aid
+    /// in detecting conflicts
     pub const fn sanitize(self) -> Self {
         match self {
             Self::Register(r) => Self::Register(r),
@@ -276,7 +405,7 @@ impl Display for Location {
     }
 }
 
-pub fn parse_num(num: &str) -> Result<u32, ParseIntError> {
+fn parse_num(num: &str) -> Result<u32, ParseIntError> {
     let num = num.trim();
     if num.starts_with("0x") {
         u32::from_str_radix(num.trim_start_matches("0x"), 16)
@@ -285,44 +414,198 @@ pub fn parse_num(num: &str) -> Result<u32, ParseIntError> {
     }
 }
 
+/// Represents what an operation "does"
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Action {
-    BasicArithmetic(arithmetic::BasicOpcode, arithmetic::BasicArgs),
+    /// Basic arithmetic operations that take in a register and
+    /// either another register or an immediate, and returns the value
+    /// in a register
+    BasicArithmetic(arithmetic::Opcode, arithmetic::Args),
+    /// Arithmetic operations that involve carry bits
     CarryArithmetic(arithmetic::CarryOpcode, arithmetic::CarryArgs),
+    /// A subtraction operation
     Sub(arithmetic::SubArgs),
+    /// Operations that load data from memory
     Load(memory::LoadOpcode, memory::LoadArgs),
+    /// Operations taht store data in memory
     Store(memory::StoreOpcode, memory::StoreArgs),
+    /// Operations that extend numbers (signed or unsigned)
     Extend(arithmetic::ExtendOpcode, arithmetic::ExtendArgs),
+    /// Operations that move data between clusters
     Move(intercluster::MoveArgs),
+    /// Operations that send data to another cluster
     Send(intercluster::SendArgs),
+    /// Operations that receive data from another cluster
     Recv(intercluster::RecvArgs),
+    /// Operations that invoke comparisons
     Compare(logical::CompareOpcode, logical::CompareArgs),
-    Logical(logical::LogicalOpcode, logical::LogicalArgs),
+    /// Operations that perform basic logic
+    Logical(logical::Opcode, logical::Args),
+    /// Operations that select values based on a condition
     Select(logical::SelectOpcode, logical::SelectArgs),
 }
 
-/// Trim the start, and update the idx to point at the new start
-fn trim_start<'a>(s: &'a str, idx: &mut usize) -> &'a str {
-    let prev_len = s.len();
-    let s = s.trim_start();
-    *idx += prev_len - s.len();
-    s
+struct ParseState<'a> {
+    s: &'a str,
+    idx: usize,
+}
+
+impl<'a> ParseState<'a> {
+    fn new(s: &'a str) -> Self {
+        Self { s, idx: 0 }
+    }
+    fn split(&self, pattern: char) -> Option<(&'a str, &'a str)> {
+        self.s
+            .split_once(pattern)
+            // I know the delimiter doesn't exist, so if I'm not empty,
+            // just return myself
+            .or(if self.s.is_empty() {
+                None
+            } else {
+                Some((self.s, ""))
+            })
+    }
+    fn expect(&mut self, next: char) -> Result<(), WithContext<ParseError>> {
+        if self.s.starts_with(next) {
+            self.s = &self.s[1..];
+            self.idx += 1;
+            Ok(())
+        } else {
+            Err(WithContext {
+                source: ParseError::Unexpected {
+                    wanted: next.into(),
+                    got: self.s.chars().next().into(),
+                },
+                ctx: self.idx.into(),
+                help: None,
+            })
+        }
+    }
+    fn chomp_register(
+        &mut self,
+        pattern: char,
+    ) -> Result<(Register, SourceSpan), WithContext<ParseError>> {
+        let start = self.idx;
+        self.trim_start();
+        let Some((reg, s)) = self.split(pattern) else {
+            return Err(WithContext {
+                source: ParseError::NoRegister,
+                ctx: self.idx.into(),
+                help: None,
+            });
+        };
+        let val_len = reg.len();
+        let reg = reg.parse().map_err(|r| reg_err(r, self.idx))?;
+        self.s = s;
+        self.idx += val_len + 1;
+        Ok((reg, (start, val_len).into()))
+    }
+    fn chomp_operand(
+        &mut self,
+        pattern: char,
+    ) -> Result<(Operand, SourceSpan), WithContext<ParseError>> {
+        let start = self.idx;
+        self.trim_start();
+        let Some((operand, s)) = self.split(pattern) else {
+            return Err(WithContext {
+                source: ParseError::NoValue,
+                ctx: self.idx.into(),
+                help: None,
+            });
+        };
+        let val_len = operand.len();
+        let operand = operand
+            .parse()
+            .map_err(|op: OperandParseError| WithContext {
+                source: ParseError::BadOperand(operand.to_owned(), op),
+                ctx: (self.idx, val_len).into(),
+                help: None,
+            })?;
+        self.s = s;
+        self.idx += val_len + 1;
+        Ok((operand, (start, val_len).into()))
+    }
+    fn chomp_offset(&mut self) -> Result<(u32, SourceSpan), WithContext<ParseError>> {
+        let start = self.idx;
+        self.trim_start();
+        let Some((num, s)) = self.split('[') else {
+            return Err(WithContext {
+                source: ParseError::NoOffset,
+                ctx: self.idx.into(),
+                help: None,
+            });
+        };
+        let val_len = num.len();
+        let num = parse_num(num).map_err(|e| WithContext {
+            source: ParseError::BadOffset(e),
+            ctx: (self.idx, val_len).into(),
+            help: None,
+        })?;
+        self.s = s;
+        self.idx += val_len + 1;
+        Ok((num, (start, val_len).into()))
+    }
+    fn chomp_imm(&mut self, pattern: char) -> Result<(u32, SourceSpan), WithContext<ParseError>> {
+        let start = self.idx;
+        self.trim_start();
+        println!("{}", self.s);
+        let Some((payload, s)) = self.split(pattern) else {
+            return Err(WithContext {
+                source: ParseError::NoImmediate,
+                ctx: self.idx.into(),
+                help: None,
+            });
+        };
+        let val_len = payload.len();
+        let num = parse_num(payload).map_err(|e| WithContext {
+            source: ParseError::BadImmediate(e),
+            ctx: (self.idx, val_len).into(),
+            help: None,
+        })?;
+        self.s = s;
+        self.idx += val_len + 1;
+        Ok((num, (start, val_len).into()))
+    }
+    fn trim_start(&mut self) {
+        let len = self.s.len();
+        self.s = self.s.trim_start();
+        self.idx += len - self.s.len();
+    }
+    fn finish(mut self) -> Result<(), WithContext<ParseError>> {
+        self.trim_start();
+        if self.s.is_empty() {
+            Ok(())
+        } else {
+            Err(WithContext {
+                source: ParseError::ExpectedEnd(self.s.to_owned()),
+                ctx: (self.idx, self.s.len()).into(),
+                help: None,
+            })
+        }
+    }
 }
 
 /// Map a register error with context
 fn reg_err(r: WithContext<RegisterParseError>, idx: usize) -> WithContext<ParseError> {
+    let ctx = r.span_context(idx);
+    let help = Some(r.to_string().into());
     WithContext {
+        ctx,
+        help,
         source: r.source.into(),
-        ctx: r.span_context(idx),
-        help: None,
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct UnexpectedValue(Option<char>);
 
-impl Display for UnexpectedValue {
+/// An unexpected value (including nothing)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UnexpectedValue<T>(Option<T>);
+
+impl<T> Display for UnexpectedValue<T>
+where
+    T: Display,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(c) = self.0 {
+        if let Some(ref c) = self.0 {
             f.write_fmt(format_args!(", but got `{c}` instead"))
         } else {
             f.write_fmt(format_args!(", but hit end of input instead"))
@@ -330,6 +613,57 @@ impl Display for UnexpectedValue {
     }
 }
 
+impl<T> From<Option<T>> for UnexpectedValue<T>
+where
+    T: Display,
+{
+    fn from(value: Option<T>) -> Self {
+        Self(value)
+    }
+}
+
+impl<T> From<T> for UnexpectedValue<T>
+where
+    T: Display,
+{
+    fn from(value: T) -> Self {
+        Self(Some(value))
+    }
+}
+
+/// An expectation of value (or values)
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ExpectedValue<T>(Vec<T>);
+
+impl<T> Display for ExpectedValue<T>
+where
+    T: Display,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let vals = self
+            .0
+            .iter()
+            .map(|v| format!("`{v}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if self.0.len() == 1 {
+            f.write_str(&vals)
+        } else {
+            f.write_fmt(format_args!("One of {vals}"))
+        }
+    }
+}
+
+impl<T> From<T> for ExpectedValue<T>
+where
+    T: Display,
+{
+    fn from(value: T) -> Self {
+        Self(vec![value])
+    }
+}
+
+/// An error encountered while parsing an operation
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ParseError {
     #[error("Expected a cluster, but could not find one")]
@@ -340,6 +674,8 @@ pub enum ParseError {
     UnknownOpcode(String),
     #[error("Expected a register, but none was found")]
     NoRegister,
+    #[error("Expected an immediate, but none was found")]
+    NoImmediate,
     #[error("Failed to parse register: {0}")]
     BadRegister(RegisterParseError),
     #[error("Wrong register type: Wanted {wanted}, but got {got} instead")]
@@ -364,7 +700,10 @@ pub enum ParseError {
     #[error("Expected end of input or comment, but got `{0}`")]
     ExpectedEnd(String),
     #[error("Wanted {wanted}, but got {got} instead")]
-    UnexpectedCharacter { wanted: char, got: UnexpectedValue },
+    Unexpected {
+        wanted: ExpectedValue<char>,
+        got: UnexpectedValue<char>,
+    },
 }
 
 impl ParseError {
@@ -376,13 +715,11 @@ impl ParseError {
             | Self::BadRegister(_)
             | Self::WrongRegisterClass { got: _, wanted: _ } => Cow::Borrowed("register"),
             Self::NoOffset | Self::BadOffset(_) => Cow::Borrowed("offset"),
-            Self::NoValue | Self::BadOperand(_, _) | Self::BadImmediate(_) => {
+            Self::NoValue | Self::BadOperand(_, _) | Self::BadImmediate(_) | Self::NoImmediate => {
                 Cow::Borrowed("value")
             }
             Self::ExpectedEnd(_) => Cow::Borrowed("problem"),
-            Self::UnexpectedCharacter { wanted, got: _ } => {
-                Cow::Owned(format!("Expected '{wanted}'"))
-            }
+            Self::Unexpected { wanted, got: _ } => Cow::Owned(format!("Expected {wanted}")),
         }
     }
 }
@@ -396,33 +733,33 @@ impl From<RegisterParseError> for ParseError {
 fn check_cluster(
     r1: Register,
     r2: Register,
-    idx: usize,
-    len: usize,
+    ctx: SourceSpan,
 ) -> Result<(), WithContext<ParseError>> {
-    if r1.cluster != r2.cluster {
+    if r1.cluster == r2.cluster {
+        Ok(())
+    } else {
         Err(WithContext {
-            ctx: (idx, len).into(),
-            help: Some(help::CLUSTER_MISMATCH.into()),
+            ctx: (ctx.offset() + 1).into(),
+            help: Some(help::CLUSTER_MISMATCH),
             source: ParseError::RegisterClusterMismatch(r1.cluster, r2.cluster),
         })
-    } else {
-        Ok(())
     }
 }
 
 impl FromStr for Action {
     type Err = WithContext<ParseError>;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let s = s.find(COMMENT_START).map_or(s, |com| &s[..com]);
-        let mut idx = 0;
-        let s = trim_start(s, &mut idx);
         static OPCODE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\w+").unwrap());
+        let s = s.find(COMMENT_START).map_or(s, |com| &s[..com]);
+        let mut s = ParseState::new(s);
+        s.trim_start();
+        let ParseState { s, idx } = s;
 
         let Some(cap) = OPCODE.captures(s).and_then(|c| c.get(0)) else {
             return Err(WithContext {
                 source: ParseError::NoOpcode,
-                ctx: (idx, 0).into(),
-                help: Some(help::NO_OPCODE.into()),
+                ctx: idx.into(),
+                help: Some(help::NO_OPCODE),
             });
         };
         let opcode = cap.as_str();
@@ -435,7 +772,7 @@ impl FromStr for Action {
                 help: p.help,
             }
         };
-        if let Ok(ar_opcode) = opcode.parse::<arithmetic::BasicOpcode>() {
+        if let Ok(ar_opcode) = opcode.parse::<arithmetic::Opcode>() {
             Ok(Self::BasicArithmetic(ar_opcode, rest.parse().map_err(err)?))
         } else if let Ok(cg_opcode) = opcode.parse::<arithmetic::CarryOpcode>() {
             Ok(Self::CarryArithmetic(cg_opcode, rest.parse().map_err(err)?))
@@ -447,7 +784,7 @@ impl FromStr for Action {
             Ok(Self::Extend(ex_opcode, rest.parse().map_err(err)?))
         } else if let Ok(cmp_opcode) = opcode.parse::<logical::CompareOpcode>() {
             Ok(Self::Compare(cmp_opcode, rest.parse().map_err(err)?))
-        } else if let Ok(lg_opcode) = opcode.parse::<logical::LogicalOpcode>() {
+        } else if let Ok(lg_opcode) = opcode.parse::<logical::Opcode>() {
             Ok(Self::Logical(lg_opcode, rest.parse().map_err(err)?))
         } else if let Ok(slct_opcode) = opcode.parse::<logical::SelectOpcode>() {
             Ok(Self::Select(slct_opcode, rest.parse().map_err(err)?))
@@ -461,8 +798,8 @@ impl FromStr for Action {
             Ok(Self::Recv(rest.parse().map_err(err)?))
         } else {
             // No matched op code
-            let help = arithmetic::BasicOpcode::iter()
-                .map(arithmetic::BasicOpcode::code)
+            let help = arithmetic::Opcode::iter()
+                .map(arithmetic::Opcode::code)
                 .chain(memory::LoadOpcode::iter().map(LoadOpcode::code))
                 .filter_map(|op| fuzzy_match(opcode, op).map(|s| (op, s)))
                 .max_by_key(|&(_, s)| s)
@@ -478,6 +815,7 @@ impl FromStr for Action {
 }
 
 impl Action {
+    /// The inputs for this operation
     pub fn inputs(&self) -> Vec<Location> {
         match self {
             Self::BasicArithmetic(_, args) => args.inputs(),
@@ -494,6 +832,7 @@ impl Action {
             Self::Select(_, args) => args.inputs(),
         }
     }
+    /// The outputs for this operation
     pub fn outputs(&self) -> Vec<Location> {
         match self {
             Self::BasicArithmetic(_, args) => args.outputs(),
@@ -510,6 +849,7 @@ impl Action {
             Self::Select(_, args) => args.outputs(),
         }
     }
+    /// Decode this operation into concrete outcomes
     pub fn decode(&self, machine: &Machine) -> Result<Vec<Outcome>, DecodeError> {
         match self {
             Self::BasicArithmetic(op, args) => args.decode(*op, machine),
@@ -526,6 +866,7 @@ impl Action {
             Self::Select(op, args) => args.decode(*op, machine),
         }
     }
+    /// Obtain a textual representation of the command code (opcode)
     pub const fn code(&self) -> &'static str {
         match self {
             Self::BasicArithmetic(op, _) => op.code(),
@@ -542,13 +883,19 @@ impl Action {
             Self::Recv(_) => "recv",
         }
     }
+    /// Obtain the used resource
     pub const fn kind(&self) -> Resource {
         match self {
             Self::BasicArithmetic(op, _) => op.kind(),
-            Self::CarryArithmetic(op, _) => op.kind(),
-            Self::Sub(_) | Self::Extend(_, _) => Resource::Arithmetic,
-            Self::Move(_) | Self::Send(_) | Self::Recv(_) => Resource::Arithmetic,
-            Self::Compare(_, _) | Self::Logical(_, _) | Self::Select(_, _) => Resource::Arithmetic,
+            Self::CarryArithmetic(_, _)
+            | Self::Sub(_)
+            | Self::Extend(_, _)
+            | Self::Compare(_, _)
+            | Self::Logical(_, _)
+            | Self::Select(_, _)
+            | Self::Move(_)
+            | Self::Send(_)
+            | Self::Recv(_) => Resource::Arithmetic,
             Self::Load(_, _) => Resource::Load,
             Self::Store(_, _) => Resource::Store,
         }
@@ -574,20 +921,52 @@ impl Display for Action {
     }
 }
 
+/// A single operation within an [`Instruction`]
+///
+/// An operation in VLIW is similar to the concept of an instruction in
+/// traditional assembly. In traditional assembly, there's only one slot
+/// to issue commands; in VLIW, there are potentially more, so a single
+/// cycle can contain multiple commands. Each of those commands in VLIW
+/// is known as an `Operation`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Operation {
+    /// If present, this is the context within which an operation was found.
+    /// Typically, this context is absolute; for example, the absolute position
+    /// within a source file. By default, it's not provided; this allows parsing
+    /// an operation directly from a single line, without the context of the rest
+    /// of the source code.
+    ///
+    /// The first entry in the tuple represents the line number (one-indexed) that
+    /// this operation occured on; the second represents the absolute span that
+    /// this operation resides within.
     pub ctx: Option<(usize, SourceSpan)>,
+    /// The cluster this operation was invoked in
     pub cluster: usize,
+    /// The action this operation will undertake
     pub action: Action,
 }
 
 impl Operation {
+    /// Generate a summary of this command
+    ///
+    /// The full-blown display method for an `Operation` displays the
+    /// entire command, including all the inputs and outputs. However,
+    /// this is too much for just referring to the operation quickly; that
+    /// is where this method is most useful. Typically it will be used to
+    /// refer to an operation that caused undefined behavior.
     pub fn summary(&self) -> String {
-        let out = format!("{} instruction", self.action.code());
+        let out = format!("{} operation", self.action.code());
         if let Some((line, _)) = self.ctx {
             out + &format!(" on line {line}")
         } else {
             out
+        }
+    }
+    /// Add context to an operation
+    pub fn with_context(self, ctx: (usize, SourceSpan)) -> Self {
+        Self {
+            ctx: Some(ctx),
+            ..self
         }
     }
 }
@@ -608,28 +987,20 @@ impl FromStr for Operation {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         static CLUSTER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d+").unwrap());
         // Chomp whitespace
-        let mut idx = 0;
-        let s = trim_start(s, &mut idx);
-        // Should start with c
-        if !s.starts_with('c') {
-            return Err(WithContext {
-                source: ParseError::UnexpectedCharacter {
-                    wanted: 'c',
-                    got: UnexpectedValue(s.chars().next()),
-                },
-                ctx: (idx, 0).into(),
-                help: Some(help::BAD_CLUSTER.into()),
-            });
-        }
-        let s = &s[1..];
-        idx += 1;
+        let mut s = ParseState::new(s);
+        s.trim_start();
+        s.expect('c').map_err(|p| WithContext {
+            help: Some(help::BAD_CLUSTER),
+            ..p
+        })?;
+        let ParseState { s, mut idx } = s;
         // First thing better be cluster
         let Some(c) = CLUSTER.captures(s).and_then(|s| s.get(0)) else {
             // Couldn't find the cluster
             return Err(WithContext {
                 source: ParseError::NoCluster,
-                ctx: (idx, 0).into(),
-                help: Some(help::NO_CLUSTER.into()),
+                ctx: idx.into(),
+                help: Some(help::NO_CLUSTER),
             });
         };
         let cluster = c.as_str().parse().map_err(|_e| WithContext {
@@ -650,15 +1021,8 @@ impl FromStr for Operation {
     }
 }
 
-impl Operation {
-    pub fn with_context(self, ctx: (usize, SourceSpan)) -> Self {
-        Self {
-            ctx: Some(ctx),
-            ..self
-        }
-    }
-}
-
+/// A group of [`Operation`]s that are issued in the same
+/// cycle
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct Instruction(pub Vec<Operation>);
 
@@ -678,10 +1042,12 @@ mod test {
         str::FromStr,
     };
 
-    use crate::operation::Alignment;
+    use miette::SourceSpan;
+
+    use crate::operation::{Alignment, RegisterParseError, WithContext};
 
     use super::{
-        arithmetic::{BasicArgs, BasicOpcode, CarryArgs, CarryOpcode, SubArgs},
+        arithmetic::{Args, CarryArgs, CarryOpcode, Opcode, SubArgs},
         memory::{LoadArgs, LoadOpcode, StoreArgs, StoreOpcode},
         Action, Location, Operand, Operation, Register, RegisterClass,
     };
@@ -750,18 +1116,67 @@ mod test {
             ),
         ]);
 
-        negative::<Register, _>(&[
-            "r0.1", "$d0.1", "b", "$0.1", "$.1", "$", "0", "$r0", "",
-        ]);
+        negative::<Register, _>(&["r0.1", "$d0.1", "b", "$0.1", "$.1", "$", "0", "$r0", ""]);
+    }
+
+    #[test]
+    fn reg_diagnostic() {
+        // Should fail because no $
+        let res = "r0.1".parse::<Register>();
+        assert!(res.is_err());
+        let WithContext { source, ctx, .. } = res.unwrap_err();
+        assert_eq!(
+            source,
+            RegisterParseError::UnexpectedChar {
+                expected: '$'.into(),
+                got: 'r'.into(),
+            }
+        );
+        assert_eq!(ctx, SourceSpan::new(0.into(), 0));
+
+        // Should fail because no class
+        let res = "  $0.1".parse::<Register>();
+        assert!(res.is_err());
+        let WithContext { source, ctx, .. } = res.unwrap_err();
+        assert_eq!(source, RegisterParseError::Class);
+        assert_eq!(ctx, SourceSpan::new(3.into(), 0));
+
+        // Should fail because no cluster
+        let res = "$rx.1".parse::<Register>();
+        assert!(res.is_err());
+        let WithContext { source, ctx, .. } = res.unwrap_err();
+        assert_eq!(source, RegisterParseError::Cluster);
+        assert_eq!(ctx, SourceSpan::new(2.into(), 1));
+
+        // Should fail because no cluster
+        let res = "$r.1".parse::<Register>();
+        assert!(res.is_err());
+        let WithContext { source, ctx, .. } = res.unwrap_err();
+        assert_eq!(source, RegisterParseError::Cluster);
+        assert_eq!(ctx, SourceSpan::new(2.into(), 0));
+
+        // Should fail because bad number
+        let res = "$r0.".parse::<Register>();
+        assert!(res.is_err());
+        let WithContext { source, ctx, .. } = res.unwrap_err();
+        assert_eq!(source, RegisterParseError::Number);
+        assert_eq!(ctx, SourceSpan::new(4.into(), 0));
+
+        // Should fail because bad number
+        let res = "$r0.x".parse::<Register>();
+        assert!(res.is_err());
+        let WithContext { source, ctx, .. } = res.unwrap_err();
+        assert_eq!(source, RegisterParseError::Number);
+        assert_eq!(ctx, SourceSpan::new(4.into(), 1));
     }
 
     #[test]
     fn reg_display() {
         display(&[
             (
-                "$r0.1",
+                "$r1.1",
                 Register {
-                    cluster: 0,
+                    cluster: 1,
                     class: RegisterClass::General,
                     num: 1,
                 },
@@ -821,8 +1236,8 @@ mod test {
                 "c0 maxu $r0.3 = $r0.1, $r0.2",
                 Operation {
                     action: Action::BasicArithmetic(
-                        BasicOpcode::MaxUnsigned,
-                        BasicArgs {
+                        Opcode::MaxUnsigned,
+                        Args {
                             src1: Register {
                                 cluster: 0,
                                 num: 1,
@@ -957,8 +1372,8 @@ mod test {
                 "c0 maxu $r0.3 = $r0.1, $r0.2",
                 Operation {
                     action: Action::BasicArithmetic(
-                        BasicOpcode::MaxUnsigned,
-                        BasicArgs {
+                        Opcode::MaxUnsigned,
+                        Args {
                             src1: Register {
                                 cluster: 0,
                                 num: 1,

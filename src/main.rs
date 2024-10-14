@@ -1,133 +1,70 @@
 //! Vex Simulator, written in Rust
-
 use clap::Parser;
-use machine::{Machine, MemoryValue, Violation, OUTPUT_REG};
 use miette::{Diagnostic, IntoDiagnostic, NamedSource, SourceSpan};
-use operation::WithContext;
+use std::borrow::Cow;
 use std::fs;
-use std::num::NonZeroUsize;
-use std::{borrow::Cow, fmt::Display};
+use std::path::PathBuf;
 use thiserror::Error;
 
-mod machine;
-mod operation;
+use vex::operation::{Instruction, Operation, ParseError, Register, RegisterClass, WithContext};
+use vex::machine::{self, Machine, MemoryValue, Violation, OUTPUT_REG};
 
-use operation::{Instruction, Location, Operation, ParseError};
+mod config;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumIter)]
-enum Resource {
-    Arithmetic,
-    Multiplication,
-    Load,
-    Store,
-}
-
-impl Display for Resource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Arithmetic => "Arithmetic & Logic",
-            Self::Load => "Memory Load",
-            Self::Store => "Memory Store",
-            Self::Multiplication => "Multiplier",
-        })
-    }
-}
-
-/// Describes how a result should be committed
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct Outcome {
-    /// The value to be committed
-    value: u32,
-    /// The location to store
-    dst: Location,
-}
-
-impl Outcome {
-    /// Commit this outcome to memory or the register bank
-    pub fn commit(&self, machine: &mut Machine) {
-        match self.dst {
-            // Alignment has already been checked
-            Location::Memory(m, a) => {
-                machine
-                    .write_memory(m, MemoryValue::new(self.value, a))
-                    .unwrap();
-            }
-            Location::Register(r) => {
-                machine[r] = self.value;
-            }
-        }
-    }
-}
-
-impl Display for Outcome {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("{} = {}", self.dst, self.value))
-    }
-}
+const INPUT_REG: Register = Register {
+    cluster: 0,
+    class: RegisterClass::General,
+    num: 3,
+};
 
 #[derive(clap::Parser, Debug, Clone, PartialEq, Eq, Hash)]
 #[command(version)]
 struct Args {
-    /// Number of slots
-    #[arg(long, short, default_value_t = NonZeroUsize::new(4).unwrap())]
-    num_slots: NonZeroUsize,
-    /// Number of clusteres
-    #[arg(long, short, default_value_t = NonZeroUsize::new(1).unwrap())]
-    num_clusters: NonZeroUsize,
-    /// Number of integer resources
-    #[arg(long, default_value_t = NonZeroUsize::new(4).unwrap())]
-    alu_slots: NonZeroUsize,
-    /// Latency for ALU operations
-    #[arg(long, default_value_t = NonZeroUsize::new(1).unwrap())]
-    alu_latency: NonZeroUsize,
-    /// Number of multipliers
-    #[arg(long, default_value_t = NonZeroUsize::new(2).unwrap())]
-    mul_slots: NonZeroUsize,
-    /// Latency for MUL operations
-    #[arg(long, default_value_t = NonZeroUsize::new(2).unwrap())]
-    mul_latency: NonZeroUsize,
-    /// Number of memory load resources
-    #[arg(long, default_value_t = NonZeroUsize::new(1).unwrap())]
-    load_slots: NonZeroUsize,
-    /// Number of memory store resources
-    #[arg(long, default_value_t = NonZeroUsize::new(1).unwrap())]
-    store_slots: NonZeroUsize,
-    /// Latency for LOAD operations
-    #[arg(long, default_value_t = NonZeroUsize::new(3).unwrap())]
-    load_latency: NonZeroUsize,
-    /// Latency for STORE operations
-    #[arg(long, default_value_t = NonZeroUsize::new(3).unwrap())]
-    store_latency: NonZeroUsize,
+    /// Path to TOML configuration file; used for machine configuration, among
+    /// other things. If not given, the default machine parameters will be
+    /// used instead.
+    #[arg(long, short)]
+    config: Option<PathBuf>,
     /// Assert to print debugging information; useful if your code is failing
     /// to compile or producing... interesting results
     #[arg(long, short, default_value_t = false)]
     verbose: bool,
-    /// Size of memory, in bytes
-    #[arg(long, default_value_t = NonZeroUsize::new(4096).unwrap())]
-    mem_size: NonZeroUsize,
-    /// Number of general-purpose registers. This is in addition to
-    /// the zero register, $r0.0
-    #[arg(long, default_value_t = NonZeroUsize::new(64).unwrap())]
-    num_regs: NonZeroUsize,
-    /// Number of branch registers
-    #[arg(long, default_value_t = NonZeroUsize::new(8).unwrap())]
-    num_bregs: NonZeroUsize,
     /// Basic Block file
     file: String,
     /// Numbers (inputs for your VEX code)
     nums: Vec<u32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 enum ParameterError {
-    #[error("Memory must be at least 4 bytes; given {0}")]
-    NotEnoughMemory(usize),
-    #[error("Memory must be aligned to 4 bytes; given {0}")]
-    BadMemoryAlign(usize),
+    #[error("Configuration file error")]
+    ConfigFile(#[from] config::Error),
+    #[error("Machine Configuration error: {0:?}")]
+    MachineConfig(#[from] machine::ConstructionError),
     #[error("Exactly 10 numbers must be provided; {0} given")]
     InvalidArguments(usize),
     #[error("Input file `{0}` not found")]
     FileNotFound(String),
+}
+
+impl<'a> TryFrom<&Args> for Machine<'a> {
+    type Error = ParameterError;
+    fn try_from(args: &Args) -> Result<Self, Self::Error> {
+        if args.nums.len() != 10 {
+            return Err(ParameterError::InvalidArguments(args.nums.len()));
+        }
+        let cfg: machine::Args = match &args.config {
+            Some(p) => config::get_config(p)?.into(),
+            None => config::Config::default().into()
+        };
+        let mut machine: Machine = cfg.try_into().map_err(ParameterError::MachineConfig)?;
+        for (m, n) in (0x18..=0x2c).step_by(4).zip(args.nums.iter().skip(1)) {
+            machine.write_memory(m, MemoryValue::Word(*n)).unwrap();
+        }
+        machine.write_memory(0x30, MemoryValue::Word(args.nums[8])).unwrap();
+        machine[INPUT_REG] = args.nums[9];
+        Ok(machine)
+    }
 }
 
 #[derive(Error, Debug, Clone, PartialEq, Eq, Hash, Diagnostic)]
@@ -157,28 +94,7 @@ struct ParseDiagnostic {
     help: Option<Cow<'static, str>>,
 }
 
-fn main() -> miette::Result<()> {
-    miette::set_hook(Box::new(|_| {
-        Box::new(
-            miette::MietteHandlerOpts::new()
-                .terminal_links(true)
-                .width(120)
-                .break_words(true)
-                .wrap_lines(true)
-                .context_lines(5)
-                .build(),
-        )
-    }))
-    .into_diagnostic()?;
-    let args = Args::parse();
-    let backing = fs::read_to_string(&args.file)
-        .map_err(|_| ParameterError::FileNotFound(args.file.clone()))
-        .into_diagnostic()?
-        // Sanitize line endings
-        .lines()
-        .map(str::trim_end)
-        .collect::<Vec<_>>()
-        .join("\n");
+fn parse_insts(backing: &str, args: &Args) -> Result<Vec<Instruction>, Box<ParseDiagnostic>> {
     let lines: Vec<(usize, SourceSpan, &str)> =
         backing
             .lines()
@@ -215,7 +131,7 @@ fn main() -> miette::Result<()> {
                     element,
                     problem,
                     source,
-                    src: NamedSource::new(&args.file, backing.clone()),
+                    src: NamedSource::new(&args.file, backing.to_owned()),
                     help: p.help,
                 }
             })?;
@@ -224,7 +140,34 @@ fn main() -> miette::Result<()> {
     }
     // Push one more to ensure we have a cycle to clear the last of the pending
     insts.push(Instruction::default());
-    let insts = insts;
+    Ok(insts)
+}
+
+fn main() -> miette::Result<()> {
+    miette::set_hook(Box::new(|_| {
+        Box::new(
+            miette::MietteHandlerOpts::new()
+                .terminal_links(true)
+                .width(120)
+                .break_words(true)
+                .wrap_lines(true)
+                .context_lines(5)
+                .build(),
+        )
+    }))
+    .into_diagnostic()?;
+    let args = Args::parse();
+    let backing = fs::read_to_string(&args.file)
+        .map_err(|_| ParameterError::FileNotFound(args.file.clone()))
+        .into_diagnostic()?
+        // Sanitize line endings
+        .lines()
+        // Sanitize tabs into four spaces
+        .map(|s| s.trim_end().replace('\t', "    "))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let insts = parse_insts(&backing, &args).map_err(|b| *b)?;
 
     let mut machine: Machine<'_> = (&args).try_into().into_diagnostic()?;
 

@@ -1,17 +1,33 @@
+//! Memory operations
+//!
+//! In general, Vex operations must only concern registers. Things like
+//! adding numbers or branching can **only** depend on values that already
+//! exist in registers.
+//!
+//! While perhaps toy programs can subsist solely on registers, more
+//! complex programs will need to "spill" into memory. Operations in this
+//! module facilitate this.
 use std::{fmt::Display, str::FromStr};
 
-use crate::{operation::Alignment, Location, Machine, Outcome};
+use crate::machine::Machine;
+use crate::operation::{Alignment, Location, Outcome};
 
 use super::{
-    check_cluster, parse_num, reg_err, trim_start, DecodeError, Info, ParseError, Register, RegisterClass, RegisterParseError, WithContext
+    check_cluster, DecodeError, Info, ParseError, ParseState, Register, RegisterClass, WithContext,
 };
 
+/// Opcodes for operations that load from memory
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumIter)]
 pub enum LoadOpcode {
+    /// Load an entire 32-bit word
     Word,
+    /// Load a short (16 bits), respecting the signedness
     HalfWordSigned,
+    /// Load an unsigned short (16 bits)
     HalfWordUnsigned,
+    /// Load a byte (8 bits), respecting the signedness
     ByteSigned,
+    /// Load an unsigned byte (8 bits)
     ByteUnsigned,
 }
 
@@ -26,6 +42,7 @@ impl From<LoadOpcode> for Alignment {
 }
 
 impl LoadOpcode {
+    /// Generate a textual representation of this opcode
     pub const fn code(self) -> &'static str {
         match self {
             Self::Word => "ldw",
@@ -57,94 +74,50 @@ impl Display for LoadOpcode {
     }
 }
 
+/// Arguments for a load operation
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LoadArgs {
+    /// The "base" register. This provides the base address in memory
     pub(crate) base: Register,
+    /// The offset in memory. This is relative to the [`base`](`LoadArgs::base`) register.
     pub(crate) offset: u32,
+    /// The destination register; where the value from memory will be stored
     pub(crate) dst: Register,
 }
 
 impl FromStr for LoadArgs {
     type Err = WithContext<ParseError>;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut idx = 0;
-        let s = trim_start(s, &mut idx);
+        let mut s = ParseState::new(s);
         // Chomp the destination register
-        let Some((dst, s)) = s.split_once('=') else {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        };
-        let val_len = dst.len();
-        let dst: Register = dst.parse().map_err(|r| reg_err(r, idx))?;
+        let (dst, ctx) = s.chomp_register('=')?;
         if dst.class != RegisterClass::General {
             return Err(WithContext {
                 source: ParseError::WrongRegisterClass {
                     wanted: RegisterClass::General,
                     got: dst.class,
                 },
-                ctx: (idx, 0).into(),
+                ctx,
                 help: None,
             });
         }
         // We're past the =, trim and get the offset
-        idx += val_len + 1;
-        let s = trim_start(s, &mut idx);
-        let Some((offset, s)) = s.split_once('[') else {
-            return Err(WithContext {
-                source: ParseError::NoOffset,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        };
-        let val_len = offset.len();
-        let offset = parse_num(offset).map_err(|e| WithContext {
-            source: ParseError::BadOffset(e),
-            ctx: (idx, val_len).into(),
-            help: None,
-        })?;
-        idx += val_len + 1;
-        let s = trim_start(s, &mut idx);
+        let (offset, _) = s.chomp_offset()?;
         // We're now at the [reg]. get to the next ]
-        let Some((base, s)) = s.split_once(']') else {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        };
-        let val_len = base.len();
-        let base: Register =
-            base.parse()
-                .map_err(|e: WithContext<RegisterParseError>| WithContext {
-                    source: ParseError::BadRegister(e.source),
-                    ctx: e.span_context(idx),
-                    help: None,
-                })?;
+        let (base, ctx) = s.chomp_register(']')?;
         if base.class != RegisterClass::General {
             return Err(WithContext {
                 source: ParseError::WrongRegisterClass {
                     wanted: RegisterClass::General,
                     got: base.class,
                 },
-                ctx: (idx, 0).into(),
+                ctx,
                 help: None,
             });
         }
-        check_cluster(dst, base, idx, val_len)?;
-        idx += val_len + 1;
-        let s = trim_start(s, &mut idx);
-        if !s.is_empty() {
-            Err(WithContext {
-                source: ParseError::ExpectedEnd(s.to_owned()),
-                ctx: (idx, s.len()).into(),
-                help: None,
-            })
-        } else {
-            Ok(Self { base, offset, dst })
-        }
+        check_cluster(dst, base, ctx)?;
+        s.finish()?;
+        Ok(Self { base, offset, dst })
     }
 }
 
@@ -180,14 +153,19 @@ impl Display for LoadArgs {
     }
 }
 
+/// Opcodes for operations that store data in memory
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumIter)]
 pub enum StoreOpcode {
+    /// Store an entire 32-bit word
     Word,
+    /// Store a 16-bit short
     HalfWord,
+    /// Store a single 8-bit byte
     Byte,
 }
 
 impl StoreOpcode {
+    /// Get a textual representation of this opcode
     pub const fn code(self) -> &'static str {
         match self {
             Self::Word => "stw",
@@ -195,6 +173,7 @@ impl StoreOpcode {
             Self::Byte => "stb",
         }
     }
+    /// Get the expected alignment for this operation
     pub const fn alignment(self) -> Alignment {
         match self {
             Self::Word => Alignment::Word,
@@ -222,109 +201,52 @@ impl Display for StoreOpcode {
     }
 }
 
+/// Arguments for operations that store data in memory
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StoreArgs {
+    /// The base address in memory
     pub(crate) base: Register,
+    /// The offset into memory. This is relative to the [base](`StoreArgs::base`)
     pub(crate) offset: u32,
+    /// The data to be stored
     pub(crate) src: Register,
 }
 
 impl FromStr for StoreArgs {
     type Err = WithContext<ParseError>;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut idx = 0;
-        let s = trim_start(s, &mut idx);
+        let mut s = ParseState::new(s);
         // Chomp the offset
-        let Some((offset, s)) = s.split_once('[') else {
-            return Err(WithContext {
-                source: ParseError::NoOffset,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        };
-        let val_len = offset.len();
-        let offset = parse_num(offset).map_err(|e| WithContext {
-            source: ParseError::BadOffset(e),
-            ctx: (idx, val_len).into(),
-            help: None,
-        })?;
-        idx += val_len + 1;
+        let (offset, _) = s.chomp_offset()?;
         // Chomp the base register
-        let s = trim_start(s, &mut idx);
-        let Some((base, s)) = s.split_once(']') else {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        };
-        let val_len = base.len();
-        let base: Register =
-            base.parse()
-                .map_err(|e: WithContext<RegisterParseError>| WithContext {
-                    source: ParseError::BadRegister(e.source),
-                    ctx: e.span_context(idx),
-                    help: None,
-                })?;
+        let (base, ctx) = s.chomp_register(']')?;
         if base.class != RegisterClass::General {
             return Err(WithContext {
                 source: ParseError::WrongRegisterClass {
                     wanted: RegisterClass::General,
                     got: base.class,
                 },
-                ctx: (idx, 0).into(),
+                ctx,
                 help: None,
             });
         }
-        idx += val_len + 1;
-        // Chomp the source register
-        let s = trim_start(s, &mut idx);
-        if !s.starts_with('=') {
-            return Err(WithContext {
-                source: ParseError::UnexpectedCharacter {
-                    wanted: '=',
-                    got: super::UnexpectedValue(s.chars().next()),
-                },
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        }
-        let s = &s[1..];
-        idx += 1;
-        let s = trim_start(s, &mut idx);
-        let mut splitter = s.split_whitespace();
-        let Some(src) = splitter.next() else {
-            return Err(WithContext {
-                source: ParseError::NoRegister,
-                ctx: (idx, 0).into(),
-                help: None,
-            });
-        };
-
-        let val_len = src.len();
-        let src: Register = src.parse().map_err(|r| reg_err(r, idx))?;
+        s.trim_start();
+        s.expect('=')?;
+        s.trim_start();
+        let (src, ctx) = s.chomp_register(' ')?;
         if src.class != RegisterClass::General {
             return Err(WithContext {
                 source: ParseError::WrongRegisterClass {
                     wanted: RegisterClass::General,
                     got: src.class,
                 },
-                ctx: (idx, 0).into(),
+                ctx,
                 help: None,
             });
         }
-        check_cluster(base, src, idx, val_len)?;
-        idx += val_len + 1;
-        let s = trim_start(splitter.next().unwrap_or_default(), &mut idx);
-        if !s.is_empty() {
-            Err(WithContext {
-                source: ParseError::ExpectedEnd(s.to_owned()),
-                ctx: (idx, s.len()).into(),
-                help: None,
-            })
-        } else {
-            Ok(Self { base, offset, src })
-        }
+        check_cluster(base, src, ctx)?;
+        s.finish()?;
+        Ok(Self { base, offset, src })
     }
 }
 
@@ -400,7 +322,7 @@ mod test {
                 },
             ),
             (
-                "        $r0.4       = 5     [$r0.1]    ",
+                "        $r0.4       = 5     [   $r0.1        ]    ",
                 LoadArgs {
                     base: Register {
                         cluster: 0,
