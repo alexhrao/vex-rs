@@ -235,7 +235,6 @@ pub struct Args {
     pub num_muls: usize,
     pub num_loads: usize,
     pub num_stores: usize,
-    pub mem_size: usize,
     pub alu_latency: usize,
     pub mul_latency: usize,
     pub store_latency: usize,
@@ -254,8 +253,6 @@ pub enum ConstructionError {
     ZeroRegisters,
     #[error("You must have at least one operation slot")]
     ZeroSlots,
-    #[error("There must be at least 4 bytes of memory")]
-    BadMemory,
 }
 
 impl<'a> TryFrom<Args> for Machine<'a> {
@@ -292,16 +289,13 @@ impl<'a> TryFrom<Args> for Machine<'a> {
         if value.num_slots == 0 {
             return Err(ConstructionError::ZeroSlots);
         }
-        if value.mem_size < 4 {
-            return Err(ConstructionError::BadMemory);
-        }
         Ok(Self {
             alu_latency: value.alu_latency,
             alus: Vec::with_capacity(value.num_alus),
             clusters,
             load_latency: value.load_latency,
             loads: Vec::with_capacity(value.num_loads),
-            mem: vec![0u8; value.mem_size],
+            memory: HashMap::new(),
             num_slots: value.num_slots,
             mul_latency: value.mul_latency,
             muls: Vec::with_capacity(value.num_muls),
@@ -327,7 +321,6 @@ pub struct Machine<'a> {
     num_loads: usize,
     num_stores: usize,
     clusters: Vec<Cluster>,
-    mem: Vec<u8>,
     alus: Vec<Issued<'a>>,
     muls: Vec<Issued<'a>>,
     loads: Vec<Issued<'a>>,
@@ -336,6 +329,7 @@ pub struct Machine<'a> {
     mul_latency: usize,
     store_latency: usize,
     load_latency: usize,
+    memory: HashMap<usize, u8>,
     /// Pending reads. The key is the location read, while
     /// the value is the operation responsible for the read,
     /// plus the cycle in which this read will have finished
@@ -418,22 +412,15 @@ impl<'a> Machine<'a> {
         .copied()
         .ok_or(DecodeError::InvalidRegister(r))
     }
-    // pub fn get_reg_mut(&mut self, r: Register) -> Result<&mut u32, DecodeError> {
-    //     match r.bank {
-    //         RegisterType::Branch => self.bregs.get_mut(r.num),
-    //         RegisterType::General => self.gregs.get_mut(r.num),
-    //         RegisterType::Link => todo!(),
-    //     }
-    //     .ok_or(DecodeError::InvalidRegister(r))
-    // }
     pub fn read_memory(&self, addr: usize, align: Alignment) -> Result<MemoryValue, DecodeError> {
         if addr.rem_euclid(align.offset()) != 0 {
             Err(DecodeError::MisalignedAccess(addr, align))
         } else {
-            self.mem
-                .get(addr..addr + align.offset())
-                .map(MemoryValue::from)
-                .ok_or(DecodeError::AddressOutOfBounds(addr, align))
+
+            let bytes = (addr..addr + align.offset())
+                .map(|a| self.memory.get(&a).copied().ok_or(DecodeError::UninitializedRead(a, align)))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(MemoryValue::from(bytes.as_ref()))
         }
     }
     pub fn write_memory(&mut self, addr: usize, value: MemoryValue) -> Result<(), DecodeError> {
@@ -441,15 +428,14 @@ impl<'a> Machine<'a> {
         if addr.rem_euclid(align.offset()) != 0 {
             Err(DecodeError::MisalignedAccess(addr, align))
         } else {
-            let bytes = self
-                .mem
-                .get_mut(addr..addr + align.offset())
-                .ok_or(DecodeError::AddressOutOfBounds(addr, align))?;
-            match value {
-                MemoryValue::Byte(b) => bytes[0] = b,
-                MemoryValue::Half(h) => bytes.copy_from_slice(&h.to_be_bytes()),
-                MemoryValue::Word(w) => bytes.copy_from_slice(&w.to_be_bytes()),
-            };
+            let value = match value {
+                MemoryValue::Byte(b) => b as u32,
+                MemoryValue::Half(h) => h as u32,
+                MemoryValue::Word(w) => w,
+            }.to_be_bytes();
+            for (a, v) in (addr..addr + align.offset()).zip(value.into_iter()) {
+                self.memory.insert(a, v);
+            }
             Ok(())
         }
     }
@@ -511,7 +497,7 @@ impl<'a> Machine<'a> {
             let results = op.action.decode(self).map_err(|de| {
                 let op = op.clone();
                 Box::new(match de {
-                    DecodeError::AddressOutOfBounds(addr, align) => {
+                    DecodeError::AddressOutOfBounds(addr, align)|DecodeError::UninitializedRead(addr, align) => {
                         Violation::MemoryOutOfBounds(op, addr, align)
                     }
                     DecodeError::InvalidRegister(r) => Violation::RegisterOutOfBounds(op, r),
@@ -682,7 +668,7 @@ pub(crate) mod test {
                 general: vec![0u32; 128],
                 branch: vec![0u32; 128],
             }],
-            mem: vec![0u8; 4096],
+            memory: HashMap::new(),
             alus: vec![],
             muls: vec![],
             loads: vec![],

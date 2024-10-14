@@ -1,6 +1,5 @@
 [machine]
 slots = 4
-mem = 4096
 
 [machine.alu]
 slots = 4

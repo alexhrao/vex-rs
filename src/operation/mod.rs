@@ -131,6 +131,8 @@ pub enum DecodeError {
     /// The address did not respect the necessary alignment
     #[error("Address 0x{0:04x} is not aligned to the {1} boundary")]
     MisalignedAccess(usize, Alignment),
+    #[error("Adderss 0x{0:04x} was read without ever being initialized")]
+    UninitializedRead(usize, Alignment),
 }
 
 /// An error with source context

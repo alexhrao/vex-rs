@@ -27,7 +27,6 @@ impl From<&Cluster> for machine::ClusterConfig {
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Deserialize)]
 struct Machine {
     slots: usize,
-    mem: usize,
     alu: Resource,
     load: Resource,
     store: Resource,
@@ -39,7 +38,6 @@ impl Default for Machine {
     fn default() -> Self {
         Self {
             slots: 4,
-            mem: 4096,
             alu: Resource {
                 latency: 1,
                 slots: 4,
@@ -84,7 +82,6 @@ impl From<&Config> for machine::Args {
             num_muls: m.mul.slots,
             num_loads: m.load.slots,
             num_stores: m.store.slots,
-            mem_size: m.mem,
             alu_latency: m.alu.latency,
             mul_latency: m.mul.latency,
             store_latency: m.store.latency,
