@@ -198,6 +198,7 @@ main::
 ;;								## 84
 	c0    add $r0.5 = $r0.5, $r0.8   ## bblock 10, line 23,  t117,  t20,  t106
 ;;								## 85
+stuff:
 	c0    add $r0.2 = $r0.2, $r0.5   ## bblock 10, line 23,  t122,  t116,  t117
 ;;								## 86
 	c0    ldw $r0.5 = 0x30[$r0.1]  ## restore ## t32
@@ -205,7 +206,13 @@ main::
 ;;
 ;;								## 87
 	c0    add $r0.9 = $r0.9, $r0.7   ## bblock 10, line 23,  t115,  t8,  t108
+	c1    recv $r1.8 = 0x1234
+	c0    send $r0.8, 0x1234
 ;;								## 88
+so:
+much:
+stufff:
+stufffff:
 ;;								## 89
 	c0    add $r0.6 = $r0.5, $r0.3   ## bblock 10, line 23,  t119,  t32,  t36
 ;;								## 90
@@ -218,6 +225,9 @@ main::
 	c0    add $r0.9 = $r0.9, $r0.5   ## bblock 10, line 23,  t121,  t115,  t118
 ;;								## 94
 	c0    add $r0.4 = $r0.10, $r0.9   ## bblock 10, line 23,  t77,  t123,  t121
+#	c0 recv $r0.4 = 0x1234
+##	c1 send $r1.8, 0x1234
+	## c0    add $r0.4 = $r0.10, $r0.9   ## bblock 10, line 23,  t77,  t123,  t121
 ;;								## 95
 	c0    mov $r0.3 = (_?1STRINGPACKET.1 + 0)   ## addr(_?1STRINGVAR.1)(P32)
 ;;								## 96

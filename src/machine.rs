@@ -4,6 +4,7 @@ use std::{
     collections::HashMap,
     fmt::Display,
     iter,
+    num::Wrapping,
     ops::{Index, IndexMut},
 };
 
@@ -11,8 +12,12 @@ use bon::Builder;
 use strum::IntoEnumIterator;
 use thiserror::Error;
 
-use crate::operation::{
-    Alignment, DecodeError, Location, Operation, Outcome, Register, RegisterClass, Resource,
+use crate::{
+    operation::{
+        Action, Alignment, DecodeError, Instruction, Location, Operation, Outcome, Register,
+        RegisterClass, Resource,
+    },
+    program::Program,
 };
 
 /// The zero register. This one should **never** be written to
@@ -29,6 +34,7 @@ pub const OUTPUT_REG: Register = Register {
     class: RegisterClass::General,
 };
 
+/// An issued operation
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Issued<'a> {
     source: Pending<'a>,
@@ -53,9 +59,9 @@ impl<'a> Display for Issued<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct Pending<'a> {
-    issued: usize,
-    finished: usize,
+pub struct Pending<'a> {
+    issued: Wrapping<usize>,
+    finished: Wrapping<usize>,
     operation: &'a Operation,
 }
 
@@ -76,14 +82,21 @@ impl<'a> Ord for Pending<'a> {
     }
 }
 
+/// A type of memory or register contention
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ContentionType {
+    /// The first operation is reading from the same location that the second
+    /// operation is writing to
     ReadWrite(Operation, Operation),
+    /// The first operation is writing to the same location that the second
+    /// operation is reading from
     WriteRead(Operation, Operation),
+    /// Both operations are writing to the same location
     WriteWrite(Operation, Operation),
 }
 
 impl ContentionType {
+    /// Get the instructions associated with this contention
     pub const fn get_insts(&self) -> (&Operation, &Operation) {
         match self {
             Self::ReadWrite(i1, i2) | Self::WriteRead(i1, i2) | Self::WriteWrite(i1, i2) => {
@@ -93,16 +106,29 @@ impl ContentionType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Hash)]
+/// A runtime violation
+#[derive(Debug, Clone, PartialEq, Eq, Error, Hash)]
 pub enum Violation {
+    /// Too many operations were contained in the same instruction
     TooManyOperations(Operation),
+    /// The given operation overflowed the given resource
     ResourceOverflow(Operation, Resource),
+    /// Two operations contested for rights to a register
     RegisterContention(Register, ContentionType),
+    /// Two operations contested for rights to memory
     MemoryContention(ContentionType),
+    /// A non-existent register was referenced
     RegisterOutOfBounds(Operation, Register),
-    MemoryOutOfBounds(Operation, usize, Alignment),
+    /// Memory was read before it was initialized
+    UninitializedMemory(Operation, usize, Alignment),
+    /// A value's address did not respect the necessary alignment
     UnalignedAddress(Operation, usize, Alignment),
+    /// A write to a read-only location was attempted
     InvalidWrite(Operation, Location),
+    /// An intercluster `SEND` or `RECV` did not have a pair
+    UnpairedIntercluster(Operation, u32),
+    /// Multiple `SEND`s or `RECV`s contested for the same intercluster path
+    PathContention(Operation, Operation, u32),
 }
 
 impl Display for Violation {
@@ -143,7 +169,7 @@ impl Display for Violation {
             Self::RegisterOutOfBounds(_, r) => {
                 format!("The register {r} exceeds the register bank bounds")
             }
-            Self::MemoryOutOfBounds(_, m, a) => {
+            Self::UninitializedMemory(_, m, a) => {
                 format!("The {a}-aligned address {m} exceeds the bounds of memory when")
             }
             Self::UnalignedAddress(_, m, a) => {
@@ -152,27 +178,39 @@ impl Display for Violation {
             Self::InvalidWrite(_, loc) => {
                 format!("The instruction tried to write to {loc}")
             }
+            Self::UnpairedIntercluster(_, path) => {
+                format!("The instruction specified path 0x{path:x}, but no other instruction referenced this path")
+            }
+            Self::PathContention(_, _, path) => {
+                format!("The path 0x{path:x} was referenced in the same manner more than once")
+            }
         })?;
         f.write_str(". This has undefined behavior and is not allowed.")
     }
 }
 
+/// A value from memory that respects alignment
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MemoryValue {
+    /// A single byte
     Byte(u8),
+    /// A single short
     Half(u16),
+    /// A single word
     Word(u32),
 }
 
 impl MemoryValue {
+    /// Get the value as a 32-bit unsigned integer
     pub fn as_u32(self) -> u32 {
         match self {
             Self::Byte(b) => u32::from(b),
             Self::Half(h) => u32::from(h),
-            MemoryValue::Word(w) => w,
+            Self::Word(w) => w,
         }
     }
-    pub fn new(value: u32, size: Alignment) -> Self {
+    /// Create a new value using the given alignment
+    pub const fn new(value: u32, size: Alignment) -> Self {
         match size {
             #[allow(clippy::cast_possible_truncation)]
             Alignment::Byte => Self::Byte(value as u8),
@@ -181,7 +219,7 @@ impl MemoryValue {
             Alignment::Word => Self::Word(value),
         }
     }
-    fn alignment(self) -> Alignment {
+    const fn alignment(self) -> Alignment {
         match self {
             Self::Byte(_) => Alignment::Byte,
             Self::Half(_) => Alignment::Half,
@@ -203,63 +241,90 @@ impl From<&[u8]> for MemoryValue {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Cluster {
-    pub general: Vec<u32>,
-    pub branch: Vec<u32>,
+    general: Vec<u32>,
+    branch: Vec<u32>,
 }
 
+/// Cluster configuration
 #[derive(Debug)]
 pub struct ClusterConfig {
-    pub num_regs: usize,
-    pub num_branch: usize,
+    /// Number of general-purpose registers this cluster should have
+    pub regs: usize,
+    /// Number of branch registers this cluster should have
+    pub branch: usize,
 }
 
 impl TryFrom<ClusterConfig> for Cluster {
     type Error = ConstructionError;
     fn try_from(value: ClusterConfig) -> Result<Self, Self::Error> {
-        if value.num_branch <= 1 || value.num_regs == 0 {
+        if value.branch <= 1 || value.regs == 0 {
             Err(ConstructionError::ZeroRegisters)
         } else {
             Ok(Self {
-                general: vec![0u32; value.num_regs],
-                branch: vec![0u32; value.num_branch],
+                general: vec![0u32; value.regs],
+                branch: vec![0u32; value.branch],
             })
         }
     }
 }
 
+/// Arguments for creating a machine
 #[derive(Builder)]
-pub struct Args {
+pub struct Args<'a> {
+    /// The cluster(s) this machine will have
     pub clusters: Vec<ClusterConfig>,
+    /// The instruction width
     pub num_slots: usize,
+    /// The number of Arithmetic & Logic units
     pub num_alus: usize,
+    /// The number of Multipliers
     pub num_muls: usize,
+    /// The number of memory load units
     pub num_loads: usize,
+    /// The number of memory store units
     pub num_stores: usize,
+    /// The number of units available for intercluster copies
+    pub num_copies: usize,
+    /// Latency for Arithmetic & Logic operations
     pub alu_latency: usize,
+    /// Latency for multiplication
     pub mul_latency: usize,
+    /// Latency for store operations
     pub store_latency: usize,
+    /// Latency for load operations
     pub load_latency: usize,
+    /// Latency for intercluster copy operations
+    pub copy_latency: usize,
+    /// The program to load into this machine
+    pub program: &'a Program,
 }
 
+/// Problems during machine construction
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Error)]
 pub enum ConstructionError {
+    /// No latency can ever be 0
     #[error("Resource {0} must have non-zero latency")]
     ZeroLatency(Resource),
-    #[error("Resource {0} must have non-zero latency")]
+    /// All resources require at least one unit
+    #[error("Resource {0} must have at least one unit")]
     ZeroCapacity(Resource),
+    /// A machine requires at least one cluster
     #[error("You must have at least one cluster")]
     ZeroClusters,
+    /// All clusters must have ample registers
     #[error("All clusters must have a non-zero number of general and branch registers")]
     ZeroRegisters,
+    /// You must provide an instruction width of at least one operation
     #[error("You must have at least one operation slot")]
     ZeroSlots,
 }
 
-impl<'a> TryFrom<Args> for Machine<'a> {
+impl<'a> TryFrom<Args<'a>> for Machine<'a> {
     type Error = ConstructionError;
-    fn try_from(value: Args) -> Result<Self, Self::Error> {
-
-        let clusters = value.clusters.into_iter()
+    fn try_from(value: Args<'a>) -> Result<Self, Self::Error> {
+        let clusters = value
+            .clusters
+            .into_iter()
             .map(Cluster::try_from)
             .collect::<Result<Vec<_>, _>>()?;
         if value.alu_latency == 0 {
@@ -273,6 +338,9 @@ impl<'a> TryFrom<Args> for Machine<'a> {
         }
         if value.store_latency == 0 {
             return Err(ConstructionError::ZeroLatency(Resource::Store));
+        }
+        if value.copy_latency == 0 {
+            return Err(ConstructionError::ZeroLatency(Resource::Copy));
         }
         if value.num_alus == 0 {
             return Err(ConstructionError::ZeroCapacity(Resource::Arithmetic));
@@ -289,7 +357,12 @@ impl<'a> TryFrom<Args> for Machine<'a> {
         if value.num_slots == 0 {
             return Err(ConstructionError::ZeroSlots);
         }
+        if value.num_copies == 0 {
+            return Err(ConstructionError::ZeroCapacity(Resource::Copy));
+        }
         Ok(Self {
+            cycle: Wrapping(0),
+            pc: 0,
             alu_latency: value.alu_latency,
             alus: Vec::with_capacity(value.num_alus),
             clusters,
@@ -303,32 +376,47 @@ impl<'a> TryFrom<Args> for Machine<'a> {
             num_loads: value.num_loads,
             num_muls: value.num_muls,
             num_stores: value.num_stores,
+            // Multiply by 2, since they come in pairs
+            num_copies: value.num_copies * 2,
             store_latency: value.store_latency,
             stores: Vec::with_capacity(value.num_stores),
+            copy_latency: value.copy_latency,
+            copies: Vec::with_capacity(value.num_copies),
             pending_reads: HashMap::new(),
             pending_writes: HashMap::new(),
-            symbols: HashMap::new(),
+            program: value.program,
         })
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PathSignal {
+    Sent(u32),
+    Waiting(usize),
+}
 
+/// Abstract Simulation Machine
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Machine<'a> {
+    cycle: Wrapping<usize>,
+    pc: usize,
     num_slots: usize,
     num_alus: usize,
     num_muls: usize,
     num_loads: usize,
     num_stores: usize,
+    num_copies: usize,
     clusters: Vec<Cluster>,
     alus: Vec<Issued<'a>>,
     muls: Vec<Issued<'a>>,
     loads: Vec<Issued<'a>>,
     stores: Vec<Issued<'a>>,
+    copies: Vec<Issued<'a>>,
     alu_latency: usize,
     mul_latency: usize,
     store_latency: usize,
     load_latency: usize,
+    copy_latency: usize,
     memory: HashMap<usize, u8>,
     /// Pending reads. The key is the location read, while
     /// the value is the operation responsible for the read,
@@ -338,8 +426,17 @@ pub struct Machine<'a> {
     /// the value is the operation responsible for the write,
     /// plus cycle in which this write will have finished
     pending_writes: HashMap<Location, Pending<'a>>,
-    /// Symbols that map to addresses (? or are they just constants?)
-    symbols: HashMap<String, usize>,
+    /// The program I'm reading from. Interestingly, the Machine **cannot**
+    /// own this program. What we're saying here is that this program
+    /// will **not** change over the lifetime of this machine. That means
+    /// we can take references to instructions within this program freely,
+    /// because such references will only live as long as the machine (which
+    /// is the same as the program). If we owned it, those references would
+    /// either be invalid after we exited the cycle (since the reference was
+    /// taken in the program), or we'd need a mutable borrow over the lifetime
+    /// of this Machine, because otherwise a different mutable borrow of this
+    /// machine could invalidate those program references
+    program: &'a Program,
 }
 
 impl<'a> Index<Register> for Machine<'a> {
@@ -372,6 +469,7 @@ impl<'a> Machine<'a> {
             Resource::Multiplication => self.mul_latency,
             Resource::Load => self.load_latency,
             Resource::Store => self.store_latency,
+            Resource::Copy => self.copy_latency,
         }
     }
     pub(crate) const fn capacity(&self, resource: Resource) -> usize {
@@ -380,6 +478,7 @@ impl<'a> Machine<'a> {
             Resource::Load => self.num_loads,
             Resource::Store => self.num_stores,
             Resource::Multiplication => self.num_muls,
+            Resource::Copy => self.num_copies,
         }
     }
     pub(crate) const fn resource(&self, resource: Resource) -> &Vec<Issued<'a>> {
@@ -388,6 +487,7 @@ impl<'a> Machine<'a> {
             Resource::Load => &self.loads,
             Resource::Store => &self.stores,
             Resource::Multiplication => &self.muls,
+            Resource::Copy => &self.copies,
         }
     }
     fn resource_mut(&mut self, resource: Resource) -> &mut Vec<Issued<'a>> {
@@ -396,9 +496,10 @@ impl<'a> Machine<'a> {
             Resource::Load => &mut self.loads,
             Resource::Store => &mut self.stores,
             Resource::Multiplication => &mut self.muls,
+            Resource::Copy => &mut self.copies,
         }
     }
-    pub fn get_reg(&self, r: Register) -> Result<u32, DecodeError> {
+    pub(crate) fn get_reg(&self, r: Register) -> Result<u32, DecodeError> {
         let c = self
             .clusters
             .get(r.cluster)
@@ -412,17 +513,25 @@ impl<'a> Machine<'a> {
         .copied()
         .ok_or(DecodeError::InvalidRegister(r))
     }
+    /// Read a value from memory. This will error if the address doesn't have
+    /// the correct [`Alignment`], or if any byte in the address range is uninitialized
     pub fn read_memory(&self, addr: usize, align: Alignment) -> Result<MemoryValue, DecodeError> {
         if addr.rem_euclid(align.offset()) != 0 {
             Err(DecodeError::MisalignedAccess(addr, align))
         } else {
-
             let bytes = (addr..addr + align.offset())
-                .map(|a| self.memory.get(&a).copied().ok_or(DecodeError::UninitializedRead(a, align)))
+                .map(|a| {
+                    self.memory
+                        .get(&a)
+                        .copied()
+                        .ok_or(DecodeError::UninitializedRead(a, align))
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(MemoryValue::from(bytes.as_ref()))
         }
     }
+    /// Write a value to memory. This will error if the address doesn't have
+    /// the correct [`Alignment`].
     pub fn write_memory(&mut self, addr: usize, value: MemoryValue) -> Result<(), DecodeError> {
         let align = value.alignment();
         if addr.rem_euclid(align.offset()) != 0 {
@@ -432,18 +541,62 @@ impl<'a> Machine<'a> {
                 MemoryValue::Byte(b) => b as u32,
                 MemoryValue::Half(h) => h as u32,
                 MemoryValue::Word(w) => w,
-            }.to_be_bytes();
+            }
+            .to_be_bytes();
             for (a, v) in (addr..addr + align.offset()).zip(value.into_iter()) {
                 self.memory.insert(a, v);
             }
             Ok(())
         }
     }
-    pub fn issue<I>(&mut self, ops: I, cycle: usize) -> Result<(), Box<Violation>>
-    where
-        I: IntoIterator<Item = &'a Operation>,
-    {
-        for (count, op) in ops.into_iter().enumerate() {
+    /// Get the instruction that is about to be issued, if any. This will return `None`
+    /// only if there are no more instructions to execute.
+    pub fn on_deck(&self) -> Option<&'a Instruction> {
+        self.program.insts.get(self.pc)
+    }
+    pub fn pending(&self) -> impl Iterator<Item = &Pending<'a>> {
+        self.pending_writes
+            .values()
+            .chain(self.pending_reads.values().flat_map(|v| v.iter()))
+    }
+    /// Get the current cycle
+    pub fn cycle(&self) -> usize {
+        self.cycle.0
+    }
+    /// Get the instruction width
+    pub fn slots(&self) -> usize {
+        self.num_slots
+    }
+    /// Run the program to completion
+    pub fn run(&mut self) -> Result<(), Box<Violation>> {
+        loop {
+            if self.on_deck().is_none() {
+                break;
+            }
+            self.step()?;
+        }
+        Ok(())
+    }
+    pub fn step(&mut self) -> Result<Vec<Issued<'a>>, Box<Violation>> {
+        if self.on_deck().is_none() {
+            return Ok(vec![]);
+        }
+        let committed = self.commit();
+        self.issue()?;
+        Ok(committed)
+    }
+    fn issue(&mut self) -> Result<bool, Box<Violation>> {
+        let ops = match self.on_deck() {
+            None => return Ok(false),
+            Some(i) => i.0.iter().enumerate(),
+        };
+        // The current cycle
+        let cycle = self.cycle;
+        // What paths I have seen; value is the last operation to use that path
+        let mut seen_sends: HashMap<u32, &Operation> = HashMap::new();
+        let mut seen_recvs: HashMap<u32, &Operation> = HashMap::new();
+        let mut paths: HashMap<u32, (PathSignal, &Operation)> = HashMap::new();
+        for (count, op) in ops {
             if count > self.num_slots {
                 return Err(Box::new(Violation::TooManyOperations(op.clone())));
             }
@@ -494,11 +647,11 @@ impl<'a> Machine<'a> {
             // Now, we are writing to something. We need to check BOTH pending reads and pending writes
 
             // Decode step will check if the inputs or the outputs exceed bounds or are not aligned
-            let results = op.action.decode(self).map_err(|de| {
+            let mut results = op.action.decode(self).map_err(|de| {
                 let op = op.clone();
                 Box::new(match de {
-                    DecodeError::AddressOutOfBounds(addr, align)|DecodeError::UninitializedRead(addr, align) => {
-                        Violation::MemoryOutOfBounds(op, addr, align)
+                    DecodeError::UninitializedRead(addr, align) => {
+                        Violation::UninitializedMemory(op, addr, align)
                     }
                     DecodeError::InvalidRegister(r) => Violation::RegisterOutOfBounds(op, r),
                     DecodeError::MisalignedAccess(addr, align) => {
@@ -538,9 +691,70 @@ impl<'a> Machine<'a> {
                     }));
                 }
             }
+
             let r = op.action.kind();
             let latency = self.latency(r);
             let cap = self.capacity(r);
+
+            if let Action::Send(ref args) = op.action {
+                let value = self[args.src];
+                if let Some(&prev) = seen_sends.get(&args.path) {
+                    // prev was a send on this path. Bail
+                    return Err(Box::new(Violation::PathContention(
+                        prev.clone(),
+                        op.clone(),
+                        args.path,
+                    )));
+                }
+                seen_sends.insert(args.path, op);
+                if let Some((sr, op1)) = paths.remove(&args.path) {
+                    match sr {
+                        PathSignal::Waiting(idx) => {
+                            let unit = self.resource_mut(r);
+                            // Resolve that result
+                            unit[idx].results[0].value = value;
+                        }
+                        PathSignal::Sent(_) => {
+                            return Err(Box::new(Violation::PathContention(
+                                op1.clone(),
+                                op.clone(),
+                                args.path,
+                            )));
+                        }
+                    };
+                } else {
+                    // Haven't seen this one yet. Just add it
+                    paths.insert(args.path, (PathSignal::Sent(self[args.src]), op));
+                }
+            } else if let Action::Recv(ref args) = op.action {
+                if let Some(&prev) = seen_recvs.get(&args.path) {
+                    // prev was a send on this path. Bail
+                    return Err(Box::new(Violation::PathContention(
+                        prev.clone(),
+                        op.clone(),
+                        args.path,
+                    )));
+                }
+                seen_recvs.insert(args.path, op);
+                if let Some((sr, op1)) = paths.remove(&args.path) {
+                    match sr {
+                        PathSignal::Waiting(_) => {
+                            return Err(Box::new(Violation::PathContention(
+                                op1.clone(),
+                                op.clone(),
+                                args.path,
+                            )));
+                        }
+                        PathSignal::Sent(v) => {
+                            results[0].value = v;
+                        }
+                    }
+                } else {
+                    // I haven't seen a send for this yet. Add the next index as a bookmark
+                    paths.insert(args.path, (PathSignal::Waiting(self.resource(r).len()), op));
+                }
+            }
+
             let units = self.resource_mut(r);
             if units.len() == cap {
                 return Err(Box::new(Violation::ResourceOverflow(op.clone(), r)));
@@ -548,7 +762,7 @@ impl<'a> Machine<'a> {
             let pending = Pending {
                 operation: op,
                 issued: cycle,
-                finished: cycle + latency,
+                finished: cycle + Wrapping(latency),
             };
             units.push(Issued {
                 source: pending,
@@ -563,7 +777,6 @@ impl<'a> Machine<'a> {
             }
             for d in dsts {
                 // Should have already been checked
-
                 if let Some(Pending {
                     operation: prev, ..
                 }) = self.pending_writes.insert(d.sanitize(), pending)
@@ -572,9 +785,16 @@ impl<'a> Machine<'a> {
                 }
             }
         }
-        Ok(())
+        if let Some((&p, &(_, op))) = paths.iter().next() {
+            Err(Box::new(Violation::UnpairedIntercluster(op.clone(), p)))
+        } else {
+            self.cycle += 1;
+            self.pc += 1;
+            Ok(true)
+        }
     }
-    pub fn commit(&mut self, cycle: usize) -> Vec<Issued<'a>> {
+    fn commit(&mut self) -> Vec<Issued<'a>> {
+        let cycle = self.cycle;
         let mut committed: Vec<Issued<'a>> = vec![];
         for r in Resource::iter() {
             let mut kept = vec![];
@@ -661,30 +881,74 @@ impl<'a> Display for Machine<'a> {
 pub(crate) mod test {
     use std::collections::HashMap;
 
-    use super::{Cluster, Machine};
-    pub fn test_machine<'a>() -> Machine<'a> {
-        Machine {
-            clusters: vec![Cluster {
-                general: vec![0u32; 128],
-                branch: vec![0u32; 128],
-            }],
-            memory: HashMap::new(),
-            alus: vec![],
-            muls: vec![],
-            loads: vec![],
-            stores: vec![],
-            num_slots: 4,
-            num_alus: 4,
-            num_muls: 2,
-            num_loads: 1,
-            num_stores: 1,
+    use crate::{
+        operation::{Action, DecodeError, Instruction, Operation, Outcome},
+        program::Program,
+    };
+
+    use super::{Args, ClusterConfig, Machine};
+    pub fn decode<S>(action: Action, setup: S) -> Result<Vec<Outcome>, DecodeError>
+    where
+        S: FnOnce(&mut Machine),
+    {
+        let p = Program {
+            labels: HashMap::new(),
+            insts: vec![Instruction(vec![Operation {
+                ctx: None,
+                cluster: 0,
+                action: action.clone(),
+            }])],
+        };
+        let mut machine = test_machine(&p);
+        setup(&mut machine);
+        action.decode(&machine)
+    }
+    pub fn test_machine<'a>(program: &'a Program) -> Machine<'a> {
+        Args {
             alu_latency: 1,
-            mul_latency: 2,
-            store_latency: 3,
+            clusters: vec![ClusterConfig {
+                branch: 128,
+                regs: 128,
+            }],
+            copy_latency: 1,
             load_latency: 3,
-            pending_reads: HashMap::new(),
-            pending_writes: HashMap::new(),
-            symbols: HashMap::new(),
+            mul_latency: 2,
+            num_alus: 4,
+            num_copies: 1,
+            num_loads: 1,
+            num_muls: 2,
+            num_slots: 4,
+            num_stores: 1,
+            store_latency: 1,
+            program,
         }
+        .try_into()
+        .unwrap()
+        // Machine {
+        //     clusters: vec![Cluster {
+        //         general: vec![0u32; 128],
+        //         branch: vec![0u32; 128],
+        //     }],
+        //     memory: HashMap::new(),
+        //     alus: vec![],
+        //     muls: vec![],
+        //     loads: vec![],
+        //     stores: vec![],
+        //     copies: vec![],
+        //     num_slots: 4,
+        //     num_alus: 4,
+        //     num_muls: 2,
+        //     num_loads: 1,
+        //     num_stores: 1,
+        //     num_copies: 1,
+        //     alu_latency: 1,
+        //     mul_latency: 2,
+        //     store_latency: 3,
+        //     load_latency: 3,
+        //     copy_latency: 1,
+        //     pending_reads: HashMap::new(),
+        //     pending_writes: HashMap::new(),
+        //     symbols: HashMap::new(),
+        // }
     }
 }

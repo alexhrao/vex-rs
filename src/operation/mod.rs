@@ -2,7 +2,7 @@ use std::{borrow::Cow, fmt::Display, num::ParseIntError, str::FromStr, sync::Laz
 
 use fuzzy_matcher::clangd::fuzzy_match;
 use memory::LoadOpcode;
-use miette::SourceSpan;
+use miette::{Diagnostic, NamedSource, SourceSpan};
 use regex::Regex;
 use strum::IntoEnumIterator;
 use thiserror::Error;
@@ -37,6 +37,7 @@ pub enum Resource {
     Multiplication,
     Load,
     Store,
+    Copy,
 }
 
 impl Display for Resource {
@@ -46,6 +47,7 @@ impl Display for Resource {
             Self::Load => "Memory Load",
             Self::Store => "Memory Store",
             Self::Multiplication => "Multiplier",
+            Self::Copy => "Intercluster",
         })
     }
 }
@@ -125,9 +127,6 @@ pub enum DecodeError {
     /// writeable
     #[error("Register {0} either does not exist, or is not writeable")]
     InvalidRegister(Register),
-    /// The address was out of bounds with respect to the given alignment
-    #[error("Address 0x{0:04x} is out of bounds for accessing a {1}")]
-    AddressOutOfBounds(usize, Alignment),
     /// The address did not respect the necessary alignment
     #[error("Address 0x{0:04x} is not aligned to the {1} boundary")]
     MisalignedAccess(usize, Alignment),
@@ -291,7 +290,7 @@ pub enum RegisterParseError {
     /// this register is associated with does not have the referenced
     /// cluster, this register will fail to be used at runtime. See
     /// [`DecodeError::InvalidRegister`] for more details.
-    #[error("Invalid cluster")]
+    #[error("Invalid (or non-existent) cluster")]
     Cluster,
     /// The register index is invalid. Note that, as with the cluster, just
     /// because the register index is _valid_ does not mean it is correct;
@@ -550,7 +549,6 @@ impl<'a> ParseState<'a> {
     fn chomp_imm(&mut self, pattern: char) -> Result<(u32, SourceSpan), WithContext<ParseError>> {
         let start = self.idx;
         self.trim_start();
-        println!("{}", self.s);
         let Some((payload, s)) = self.split(pattern) else {
             return Err(WithContext {
                 source: ParseError::NoImmediate,
@@ -669,6 +667,7 @@ where
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ParseError {
     #[error("Expected a cluster, but could not find one")]
+    /// A cluster wasn't found to start the instruction
     NoCluster,
     #[error("Expected an opcode, but none was found")]
     NoOpcode,
@@ -679,7 +678,7 @@ pub enum ParseError {
     #[error("Expected an immediate, but none was found")]
     NoImmediate,
     #[error("Failed to parse register: {0}")]
-    BadRegister(RegisterParseError),
+    BadRegister(#[from] RegisterParseError),
     #[error("Wrong register type: Wanted {wanted}, but got {got} instead")]
     WrongRegisterClass {
         wanted: RegisterClass,
@@ -689,19 +688,21 @@ pub enum ParseError {
         "Cluster {0} found, but so was cluster {1}. This instruction only supports one cluster"
     )]
     RegisterClusterMismatch(usize, usize),
+    #[error("Operation specified cluster {0}, but register {1} isn't in that cluster")]
+    WrongRegisterCluster(usize, Register),
     #[error("Expected an offset, but none was found")]
     NoOffset,
     #[error("Failed to parse offset: {0}")]
-    BadOffset(ParseIntError),
+    BadOffset(#[source] ParseIntError),
     #[error("Failed to parse immediate: {0}")]
-    BadImmediate(ParseIntError),
+    BadImmediate(#[source] ParseIntError),
     #[error("Expected a value, but got none")]
     NoValue,
     #[error("Failed to parse operand `{0}`")]
     BadOperand(String, #[source] OperandParseError),
     #[error("Expected end of input or comment, but got `{0}`")]
     ExpectedEnd(String),
-    #[error("Wanted {wanted}, but got {got} instead")]
+    #[error("Expected `{wanted}`{got}")]
     Unexpected {
         wanted: ExpectedValue<char>,
         got: UnexpectedValue<char>,
@@ -711,7 +712,9 @@ pub enum ParseError {
 impl ParseError {
     pub fn element(&self) -> Cow<'static, str> {
         match self {
-            Self::NoCluster | Self::RegisterClusterMismatch(_, _) => Cow::Borrowed("cluster"),
+            Self::NoCluster
+            | Self::RegisterClusterMismatch(_, _)
+            | Self::WrongRegisterCluster(_, _) => Cow::Borrowed("cluster"),
             Self::NoOpcode | Self::UnknownOpcode(_) => Cow::Borrowed("opcode"),
             Self::NoRegister
             | Self::BadRegister(_)
@@ -726,9 +729,29 @@ impl ParseError {
     }
 }
 
-impl From<RegisterParseError> for ParseError {
-    fn from(value: RegisterParseError) -> Self {
-        Self::BadRegister(value)
+#[derive(Error, Debug, Clone, PartialEq, Eq, Diagnostic)]
+#[error("Operation Parse Failure")]
+pub struct ParseDiagnostic {
+    pub source: ParseError,
+    #[label("{}", source.element())]
+    pub problem: SourceSpan,
+    #[source_code]
+    pub src: NamedSource<String>,
+    #[help]
+    pub help: Option<Cow<'static, str>>,
+}
+
+impl ParseDiagnostic {
+    pub fn from_err(p: WithContext<ParseError>, src: NamedSource<String>, offset: usize) -> Self {
+        let problem = p.span_context(offset);
+        let help = p.help;
+        let source = p.source;
+        Self {
+            problem,
+            source,
+            src,
+            help,
+        }
     }
 }
 
@@ -895,11 +918,10 @@ impl Action {
             | Self::Compare(_, _)
             | Self::Logical(_, _)
             | Self::Select(_, _)
-            | Self::Move(_)
-            | Self::Send(_)
-            | Self::Recv(_) => Resource::Arithmetic,
+            | Self::Move(_) => Resource::Arithmetic,
             Self::Load(_, _) => Resource::Load,
             Self::Store(_, _) => Resource::Store,
+            Self::Send(_) | Self::Recv(_) => Resource::Copy,
         }
     }
 }
@@ -1010,11 +1032,31 @@ impl FromStr for Operation {
             ctx: (idx, c.len() - 1).into(),
             help: None,
         })?;
+        let clust_idx = idx;
         idx += c.len();
-        let op = s[c.end()..].parse().map_err(|e: WithContext<_>| {
+        let op: Action = s[c.end()..].parse().map_err(|e: WithContext<_>| {
             let span = e.span_context(idx);
             WithContext { ctx: span, ..e }
         })?;
+
+        let regs = op
+            .inputs()
+            .into_iter()
+            .chain(op.outputs())
+            .filter_map(|l| match l {
+                Location::Register(r) => Some(r),
+                Location::Memory(_, _) => None,
+            });
+
+        for r in regs {
+            if r.cluster != cluster {
+                return Err(WithContext {
+                    source: ParseError::WrongRegisterCluster(cluster, r),
+                    ctx: clust_idx.into(),
+                    help: None,
+                });
+            }
+        }
         Ok(Self {
             cluster,
             action: op,

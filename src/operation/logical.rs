@@ -513,8 +513,8 @@ mod test {
         Args, CompareArgs, CompareOpcode, Opcode,
     };
     use crate::{
-        machine::test::test_machine,
-        operation::{Info, Location, Operand, Outcome, Register, RegisterClass},
+        machine::test::decode,
+        operation::{Action, Location, Operand, Outcome, Register, RegisterClass},
     };
     #[test]
     fn compare_parser() {
@@ -630,7 +630,6 @@ mod test {
 
     #[test]
     fn compare_decode() {
-        let mut machine = test_machine();
         let args = CompareArgs {
             src1: Register {
                 cluster: 0,
@@ -644,8 +643,10 @@ mod test {
                 num: 1,
             },
         };
-        machine[args.src1] = 0x20;
-        let res = args.decode(CompareOpcode::Equal, &machine);
+        let action = Action::Compare(CompareOpcode::Equal, args);
+        let res = decode(action, |m| {
+            m[args.src1] = 0x20;
+        });
         assert!(res.is_ok());
         assert_eq!(
             vec![Outcome {
@@ -762,7 +763,7 @@ mod test {
 
     #[test]
     fn logical_decode() {
-        let mut machine = test_machine();
+        // let mut machine = test_machine();
         let args = Args {
             src1: Register {
                 cluster: 0,
@@ -780,9 +781,11 @@ mod test {
                 num: 1,
             },
         };
-        machine[args.src1] = 0x1;
-        machine[args.src2] = 0x1;
-        let res = args.decode(Opcode::And, &machine);
+        let action = Action::Logical(Opcode::And, args);
+        let res = decode(action, |m| {
+            m[args.src1] = 0x1;
+            m[args.src2] = 0x1;
+        });
         assert!(res.is_ok());
         assert_eq!(
             vec![Outcome {

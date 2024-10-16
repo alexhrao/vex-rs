@@ -1,13 +1,14 @@
 //! Vex Simulator, written in Rust
 use clap::Parser;
 use miette::{Diagnostic, IntoDiagnostic, NamedSource, SourceSpan};
-use std::borrow::Cow;
+use std::fmt::Display;
 use std::fs;
 use std::path::PathBuf;
 use thiserror::Error;
+use vex::program::Program;
 
-use vex::operation::{Instruction, Operation, ParseError, Register, RegisterClass, WithContext};
 use vex::machine::{self, Machine, MemoryValue, Violation, OUTPUT_REG};
+use vex::operation::{Register, RegisterClass};
 
 mod config;
 
@@ -35,7 +36,7 @@ struct Args {
     nums: Vec<u32>,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Error)]
 enum ParameterError {
     #[error("Configuration file error")]
     ConfigFile(#[from] config::Error),
@@ -47,29 +48,7 @@ enum ParameterError {
     FileNotFound(String),
 }
 
-impl<'a> TryFrom<&Args> for Machine<'a> {
-    type Error = ParameterError;
-    fn try_from(args: &Args) -> Result<Self, Self::Error> {
-        if args.nums.len() != 10 {
-            return Err(ParameterError::InvalidArguments(args.nums.len()));
-        }
-        let cfg: machine::Args = match &args.config {
-            Some(p) => config::get_config(p)?.into(),
-            None => config::Config::default().into()
-        };
-        let mut machine: Machine = cfg.try_into().map_err(ParameterError::MachineConfig)?;
-        for (m, n) in (0x18..=0x2c).step_by(4).zip(args.nums.iter().skip(1)) {
-            machine.write_memory(m, MemoryValue::Word(*n)).unwrap();
-        }
-        machine.write_memory(0x30, MemoryValue::Word(args.nums[8])).unwrap();
-        machine[INPUT_REG] = args.nums[9];
-        Ok(machine)
-    }
-}
-
 #[derive(Error, Debug, Clone, PartialEq, Eq, Hash, Diagnostic)]
-#[error("Undefined Behavior")]
-#[diagnostic()]
 struct ExecutionDiagnostic {
     #[help]
     violation: Violation,
@@ -81,66 +60,22 @@ struct ExecutionDiagnostic {
     prev: Option<SourceSpan>,
 }
 
-#[derive(Error, Debug, Clone, PartialEq, Eq, Diagnostic)]
-#[error("Parsing Failure")]
-struct ParseDiagnostic {
-    element: Cow<'static, str>,
-    source: ParseError,
-    #[label = "{element}"]
-    problem: SourceSpan,
-    #[source_code]
-    src: NamedSource<String>,
-    #[help]
-    help: Option<Cow<'static, str>>,
-}
-
-fn parse_insts(backing: &str, args: &Args) -> Result<Vec<Instruction>, Box<ParseDiagnostic>> {
-    let lines: Vec<(usize, SourceSpan, &str)> =
-        backing
-            .lines()
-            .enumerate()
-            .fold(vec![], |mut v, (i, line)| {
-                let start_idx = if let Some((_, span, _)) = v.last() {
-                    span.offset() + span.len() + 1
-                } else {
-                    0
-                };
-                v.push((i + 1, (start_idx, line.len()).into(), line));
-                v
-            });
-
-    let mut insts: Vec<Instruction> = vec![];
-    let mut inst = Instruction::default();
-    let inst_lines = lines
-        .iter()
-        .skip_while(|&&(_, _, l)| l != "#### BEGIN BASIC BLOCK ####")
-        .skip(1)
-        .take_while(|&&(_, _, l)| l != "#### END BASIC BLOCK ####")
-        .filter(|&&(_, _, l)| !l.trim_start().starts_with('#'));
-    for &(lineno, span, line) in inst_lines {
-        if line.trim_start().starts_with(";;") {
-            // eject
-            insts.push(inst);
-            inst = Instruction::default();
-        } else {
-            let op: Operation = line.parse().map_err(|p: WithContext<ParseError>| {
-                let problem = p.span_context(span.offset());
-                let element = p.source.element();
-                let source = p.source;
-                ParseDiagnostic {
-                    element,
-                    problem,
-                    source,
-                    src: NamedSource::new(&args.file, backing.to_owned()),
-                    help: p.help,
-                }
-            })?;
-            inst.0.push(op.with_context((lineno, span)));
-        }
+impl Display for ExecutionDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self.violation {
+            Violation::MemoryContention(_) => "Memory contention",
+            Violation::InvalidWrite(_, _) => "Wrote to unwriteable location",
+            Violation::UninitializedMemory(_, _, _) | Violation::UnalignedAddress(_, _, _) => {
+                "Invalid memory access"
+            }
+            Violation::PathContention(_, _, _) => "Cluster path contention",
+            Violation::RegisterContention(_, _) => "Register contention",
+            Violation::RegisterOutOfBounds(_, _) => "Out-of-bounds register access",
+            Violation::ResourceOverflow(_, _) => "Resource overflow",
+            Violation::TooManyOperations(_) => "Instruction width overflow",
+            Violation::UnpairedIntercluster(_, _) => "Cluster path mismatch",
+        })
     }
-    // Push one more to ensure we have a cycle to clear the last of the pending
-    insts.push(Instruction::default());
-    Ok(insts)
 }
 
 fn main() -> miette::Result<()> {
@@ -167,52 +102,94 @@ fn main() -> miette::Result<()> {
         .collect::<Vec<_>>()
         .join("\n");
 
-    let insts = parse_insts(&backing, &args).map_err(|b| *b)?;
 
-    let mut machine: Machine<'_> = (&args).try_into().into_diagnostic()?;
-
-    for (cycle, i) in insts.iter().enumerate().map(|(c, i)| (c + 1, i)) {
-        // Resolve anything that would finish this cycle
-        let resolved = machine.commit(cycle);
+    let program: Program = backing.parse().map_err(|b: vex::program::ParseError| {
+        b.as_diagnostic(NamedSource::new(&args.file, backing.clone()))
+    })?;
+    let mut machine: Machine<'_> = {
+        if args.nums.len() != 10 {
+            return Err(ParameterError::InvalidArguments(args.nums.len())).into_diagnostic();
+        }
+        let cfg = match &args.config {
+            Some(p) => config::get_config(p).into_diagnostic()?,
+            None => config::Config::default(),
+        };
+        let mut machine: Machine = cfg
+            .as_machine_args(&program)
+            .try_into()
+            .map_err(ParameterError::MachineConfig)
+            .into_diagnostic()?;
+        for (m, n) in (0x18..=0x2c).step_by(4).zip(args.nums.iter().skip(1)) {
+            machine.write_memory(m, MemoryValue::Word(*n)).unwrap();
+        }
+        machine
+            .write_memory(0x30, MemoryValue::Word(args.nums[8]))
+            .unwrap();
+        machine[INPUT_REG] = args.nums[9];
+        machine
+    };
+    loop {
+        let cycle = machine.cycle();
         if args.verbose {
-            println!("{} resolved in cycle {cycle}:", resolved.len());
-            for r in resolved {
-                println!("\t* {r}");
-            }
+            println!("=== Starting cycle {cycle} ===");
         }
         // What is about to be issued?
         if args.verbose {
-            println!("{} slots filled:", i.0.len());
-            for (s, inst) in i.0.iter().enumerate() {
-                println!("\t{s}: {inst}");
+            if let Some(i) = machine.on_deck() {
+                println!("slots ({}/{}):", i.0.len(), machine.slots());
+                for (s, inst) in i.0.iter().enumerate() {
+                    println!("\t{s}: {inst}");
+                }
             }
         }
-        // Issue instructions to their respective resources
-        if let Err(e) = machine.issue(&i.0, cycle) {
-            let span = |s: (usize, SourceSpan)| s.1;
-            let (prev, curr) = match &*e {
-                Violation::ResourceOverflow(i, _)
-                | Violation::TooManyOperations(i)
-                | Violation::RegisterOutOfBounds(i, _)
-                | Violation::MemoryOutOfBounds(i, _, _)
-                | Violation::UnalignedAddress(i, _, _)
-                | Violation::InvalidWrite(i, _) => (None, i.ctx.map(span)),
-                Violation::RegisterContention(_, c) | Violation::MemoryContention(c) => {
-                    let (i1, i2) = c.get_insts();
-                    (i1.ctx.map(span), i2.ctx.map(span))
+        match machine.step() {
+            Err(e) => {
+                let span = |s: (usize, SourceSpan)| s.1;
+                let (prev, curr) = match &*e {
+                    Violation::ResourceOverflow(i, _)
+                    | Violation::TooManyOperations(i)
+                    | Violation::RegisterOutOfBounds(i, _)
+                    | Violation::UninitializedMemory(i, _, _)
+                    | Violation::UnalignedAddress(i, _, _)
+                    | Violation::InvalidWrite(i, _)
+                    | Violation::UnpairedIntercluster(i, _) => (None, i.ctx.map(span)),
+                    Violation::PathContention(i1, i2, _) => (i1.ctx.map(span), i2.ctx.map(span)),
+                    Violation::RegisterContention(_, c) | Violation::MemoryContention(c) => {
+                        let (i1, i2) = c.get_insts();
+                        (i1.ctx.map(span), i2.ctx.map(span))
+                    }
+                };
+                Err(ExecutionDiagnostic {
+                    src: NamedSource::new(&args.file, backing.clone()),
+                    prev,
+                    curr,
+                    violation: *e,
+                })?;
+            }
+            Ok(resolved) => {
+                if args.verbose {
+                    println!("{} resolved in cycle {cycle}:", resolved.len());
+                    for r in resolved {
+                        println!("\t* {r}");
+                    }
                 }
-            };
-            Err(ExecutionDiagnostic {
-                src: NamedSource::new(&args.file, backing.clone()),
-                prev,
-                curr,
-                violation: *e,
-            })?;
+            }
         }
         if args.verbose {
             println!("Machine state at the end of cycle {cycle}:\n{machine}");
         }
+        // If nobody's on deck, I'm finished
+        if machine.on_deck().is_none() {
+            if args.verbose {
+                println!("=== No more instructions ===");
+            }
+            break;
+        }
     }
-    println!("{} in {} cycles", machine[OUTPUT_REG], insts.len());
+    // At this point, the machine should not have anything in flight
+    if machine.pending().inspect(|p| println!("{p:?}")).count() > 0 {
+        miette::bail!("Machine was stopped with operations in flight");
+    }
+    println!("{} in {} cycles", machine[OUTPUT_REG], machine.cycle());
     Ok(())
 }

@@ -755,9 +755,9 @@ mod test {
         Args, CarryArgs, ExtendArgs, Opcode,
     };
     use crate::{
-        machine::test::test_machine,
+        machine::test::decode,
         operation::{
-            arithmetic::SubArgs, Info, Location, Operand, Outcome, Register, RegisterClass,
+            arithmetic::SubArgs, Action, Location, Operand, Outcome, Register, RegisterClass,
         },
     };
     #[test]
@@ -875,7 +875,6 @@ mod test {
 
     #[test]
     fn basic_decode() {
-        let mut machine = test_machine();
         let args = Args {
             src1: Register {
                 cluster: 0,
@@ -889,8 +888,10 @@ mod test {
                 num: 1,
             },
         };
-        machine[args.src1] = 0xff;
-        let res = args.decode(Opcode::Or, &machine);
+        let action = Action::BasicArithmetic(Opcode::Or, args);
+        let res = decode(action, |m| {
+            m[args.src1] = 0xff;
+        });
         assert!(res.is_ok());
         assert_eq!(
             vec![Outcome {
@@ -999,7 +1000,6 @@ mod test {
 
     #[test]
     fn sub_decode() {
-        let mut machine = test_machine();
         let args = SubArgs {
             src2: Register {
                 cluster: 0,
@@ -1013,10 +1013,10 @@ mod test {
                 num: 1,
             },
         };
-
-        machine[args.src2] = 0x01;
-
-        let res = args.decode((), &machine);
+        let action = Action::Sub(args);
+        let res = decode(action, |m| {
+            m[args.src2] = 0x01;
+        });
         assert!(res.is_ok());
         assert_eq!(
             vec![Outcome {

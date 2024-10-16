@@ -105,9 +105,9 @@ impl Info for MoveArgs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SendArgs {
     /// The source register
-    src: Register,
+    pub(crate) src: Register,
     /// The path identifier
-    path: u32,
+    pub(crate) path: u32,
 }
 
 impl FromStr for SendArgs {
@@ -152,9 +152,9 @@ impl Info for SendArgs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RecvArgs {
     /// The destination register
-    dst: Register,
+    pub(crate) dst: Register,
     /// The path identifier
-    path: u32,
+    pub(crate) path: u32,
 }
 
 impl FromStr for RecvArgs {
@@ -189,17 +189,18 @@ impl Info for RecvArgs {
         _opcode: Self::Opcode,
         machine: &Machine,
     ) -> Result<Vec<Outcome>, DecodeError> {
-        // TODO: How do I get the register value from the corresponding SEND?
         machine.get_reg(self.dst)?;
-        todo!()
+        let dst = Location::Register(self.dst);
+        // Value will be overwritten in issue
+        Ok(vec![Outcome { dst, value: 0 }])
     }
 }
 
 #[cfg(test)]
 mod test {
     use crate::{
-        machine::test::test_machine,
-        operation::{Info, Outcome, Register, RegisterClass},
+        machine::test::decode,
+        operation::{Action, Outcome, Register, RegisterClass},
     };
 
     use super::{
@@ -274,16 +275,15 @@ mod test {
 
     #[test]
     fn mov_decode() {
-        let mut machine = test_machine();
-        let args = MoveArgs {
+        let action = Action::Move(MoveArgs {
             dst: Register {
                 cluster: 0,
                 class: RegisterClass::General,
                 num: 2,
             },
             payload: String::from("PAYLOAD"),
-        };
-        let res = args.decode((), &mut machine);
+        });
+        let res = decode(action, |_| {});
         assert!(res.is_ok());
         assert_eq!(Vec::<Outcome>::new(), res.unwrap());
     }

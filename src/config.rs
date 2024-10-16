@@ -2,7 +2,7 @@ use std::{fs, io, path::Path};
 
 use serde::Deserialize;
 use thiserror::Error;
-use vex::machine;
+use vex::{machine, program::Program};
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Deserialize)]
 struct Resource {
@@ -18,8 +18,8 @@ struct Cluster {
 impl From<&Cluster> for machine::ClusterConfig {
     fn from(value: &Cluster) -> Self {
         Self {
-            num_regs: value.regs,
-            num_branch: value.branch,
+            regs: value.regs,
+            branch: value.branch,
         }
     }
 }
@@ -31,6 +31,7 @@ struct Machine {
     load: Resource,
     store: Resource,
     mul: Resource,
+    copy: Resource,
     clusters: Vec<Cluster>,
 }
 
@@ -48,16 +49,20 @@ impl Default for Machine {
             },
             store: Resource {
                 slots: 1,
-                latency: 3,
+                latency: 1,
             },
             mul: Resource {
                 slots: 2,
                 latency: 2,
             },
+            copy: Resource {
+                slots: 1,
+                latency: 1,
+            },
             clusters: vec![Cluster {
                 branch: 8,
                 regs: 64,
-            }]
+            }],
         }
     }
 }
@@ -67,9 +72,9 @@ pub struct Config {
     machine: Machine,
 }
 
-impl From<&Config> for machine::Args {
-    fn from(value: &Config) -> Self {
-        let m = &value.machine;
+impl Config {
+    pub fn as_machine_args<'a>(&self, program: &'a Program) -> machine::Args<'a> {
+        let m = &self.machine;
         let clusters = m
             .clusters
             .iter()
@@ -82,17 +87,14 @@ impl From<&Config> for machine::Args {
             num_muls: m.mul.slots,
             num_loads: m.load.slots,
             num_stores: m.store.slots,
+            num_copies: m.copy.slots,
             alu_latency: m.alu.latency,
             mul_latency: m.mul.latency,
             store_latency: m.store.latency,
             load_latency: m.load.latency,
+            copy_latency: m.copy.latency,
+            program,
         }
-    }
-}
-
-impl From<Config> for machine::Args {
-    fn from(value: Config) -> Self {
-        (&value).into()
     }
 }
 
@@ -102,7 +104,6 @@ pub enum Error {
     FileNotFound(#[from] io::Error),
     #[error("Invalid TOML file")]
     InvalidToml(#[from] toml::de::Error),
-
 }
 
 pub fn get_config(cfg: &Path) -> Result<Config, Error> {
